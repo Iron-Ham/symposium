@@ -2,7 +2,9 @@ pub mod hooks;
 pub mod safety;
 
 use crate::config::schema::ServiceConfig;
+use crate::domain::issue::Issue;
 use crate::error::{Error, Result};
+use crate::prompt;
 use std::path::PathBuf;
 use tokio::sync::watch;
 
@@ -29,20 +31,26 @@ impl WorkspaceManager {
         Ok(dir)
     }
 
+    /// Render a hook script through Liquid with issue context.
+    fn render_hook(&self, hook: &str, issue: &Issue, attempt: Option<u32>) -> Result<String> {
+        prompt::build_prompt(hook, issue, attempt)
+    }
+
     /// Ensure the workspace directory exists, run after_create hook if newly created.
-    pub async fn ensure(&self, issue_key: &str) -> Result<PathBuf> {
-        let dir = self.workspace_dir(issue_key)?;
+    pub async fn ensure(&self, issue: &Issue) -> Result<PathBuf> {
+        let dir = self.workspace_dir(&issue.identifier)?;
         let newly_created = !dir.exists();
 
         if newly_created {
             tokio::fs::create_dir_all(&dir).await.map_err(|e| {
                 Error::Workspace(format!("failed to create workspace {}: {e}", dir.display()))
             })?;
-            tracing::info!(issue_key, path = %dir.display(), "created workspace");
+            tracing::info!(issue_key = issue.identifier, path = %dir.display(), "created workspace");
 
             let config = self.config_rx.borrow().clone();
             if let Some(hook) = &config.hooks.after_create {
-                hooks::run_hook(hook, &dir, config.hooks.timeout()).await?;
+                let rendered = self.render_hook(hook, issue, None)?;
+                hooks::run_hook(&rendered, &dir, config.hooks.timeout()).await?;
             }
         }
 
@@ -50,26 +58,28 @@ impl WorkspaceManager {
     }
 
     /// Run the before_run hook in the workspace.
-    pub async fn prepare(&self, issue_key: &str) -> Result<PathBuf> {
-        let dir = self.workspace_dir(issue_key)?;
+    pub async fn prepare(&self, issue: &Issue, attempt: Option<u32>) -> Result<PathBuf> {
+        let dir = self.workspace_dir(&issue.identifier)?;
         let config = self.config_rx.borrow().clone();
         if let Some(hook) = &config.hooks.before_run {
-            hooks::run_hook(hook, &dir, config.hooks.timeout()).await?;
+            let rendered = self.render_hook(hook, issue, attempt)?;
+            hooks::run_hook(&rendered, &dir, config.hooks.timeout()).await?;
         }
         Ok(dir)
     }
 
     /// Run the after_run hook in the workspace.
-    pub async fn finish(&self, issue_key: &str, success: bool) -> Result<()> {
-        let dir = self.workspace_dir(issue_key)?;
+    pub async fn finish(&self, issue: &Issue, success: bool) -> Result<()> {
+        let dir = self.workspace_dir(&issue.identifier)?;
         let config = self.config_rx.borrow().clone();
         if let Some(hook) = &config.hooks.after_run {
+            let rendered = self.render_hook(hook, issue, None)?;
             let mut env = std::collections::HashMap::new();
             env.insert(
                 "RUN_SUCCESS".to_string(),
                 if success { "true" } else { "false" }.to_string(),
             );
-            hooks::run_hook_with_env(hook, &dir, config.hooks.timeout(), &env).await?;
+            hooks::run_hook_with_env(&rendered, &dir, config.hooks.timeout(), &env).await?;
         }
         Ok(())
     }
