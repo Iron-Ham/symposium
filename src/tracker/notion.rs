@@ -64,10 +64,17 @@ impl NotionTracker {
             .map(|s| format!("'{s}'"))
             .collect::<Vec<_>>()
             .join(", ");
-        format!(
+        let mut query = format!(
             "SELECT * FROM \"{ds_id}\" WHERE \"{}\" IN ({status_list})",
             self.config.property_status
-        )
+        );
+        if let Some(ref user_id) = self.config.assignee_user_id {
+            query.push_str(&format!(
+                " AND \"{}\" LIKE '%{user_id}%'",
+                self.config.property_assignee
+            ));
+        }
+        query
     }
 
     /// Unwrap the MCP tool response to get the inner data.

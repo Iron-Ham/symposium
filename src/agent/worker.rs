@@ -1,192 +1,26 @@
 use super::process::AgentProcess;
-use super::protocol::*;
-use super::tools;
 use crate::config::schema::ServiceConfig;
 use crate::error::{Error, Result};
-use serde_json::{json, Value};
 
 pub struct AgentWorker {
-    process: AgentProcess,
+    pub(crate) process: AgentProcess,
+    #[allow(dead_code)]
     issue_id: String,
-    thread_id: Option<String>,
-    turn_id: Option<String>,
-    next_id: u64,
 }
 
 impl AgentWorker {
     pub fn new(process: AgentProcess, issue_id: String) -> Self {
-        Self {
-            process,
-            issue_id,
-            thread_id: None,
-            turn_id: None,
-            next_id: 1,
-        }
+        Self { process, issue_id }
     }
 
-    fn next_request_id(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
-    }
-
-    /// Perform the initialize handshake.
+    /// No-op for stream-json mode — initialization happens at spawn.
     pub async fn initialize(&mut self, _config: &ServiceConfig) -> Result<()> {
-        let req = JsonRpcRequest::new(
-            self.next_request_id(),
-            "initialize",
-            Some(json!({
-                "protocolVersion": "2024-01-01",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "symposium",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            })),
-        );
-        self.process
-            .send(&serde_json::to_value(&req).unwrap())
-            .await?;
-
-        let resp = self.read_response(req.id).await?;
-        tracing::debug!(issue_id = %self.issue_id, "agent initialized: {resp:?}");
-
-        let notif = JsonRpcNotification::new("initialized", Some(json!({})));
-        self.process
-            .send(&serde_json::to_value(&notif).unwrap())
-            .await?;
-
         Ok(())
     }
 
-    /// Start a new thread with the given prompt.
-    pub async fn start_thread(&mut self, prompt: &str) -> Result<()> {
-        let req = JsonRpcRequest::new(
-            self.next_request_id(),
-            "thread/start",
-            Some(json!({
-                "instructions": prompt
-            })),
-        );
-        self.process
-            .send(&serde_json::to_value(&req).unwrap())
-            .await?;
-
-        let resp = self.read_response(req.id).await?;
-        self.thread_id = resp
-            .get("threadId")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        tracing::info!(issue_id = %self.issue_id, thread_id = ?self.thread_id, "thread started");
+    /// No-op — the prompt is passed via stdin at spawn time.
+    pub async fn start_thread(&mut self, _prompt: &str) -> Result<()> {
         Ok(())
-    }
-
-    /// Run a single turn. Returns the turn result.
-    pub async fn run_turn(&mut self, prompt: &str) -> Result<TurnResult> {
-        let thread_id = self
-            .thread_id
-            .clone()
-            .ok_or_else(|| Error::AgentProtocol("no thread_id".into()))?;
-
-        let req = JsonRpcRequest::new(
-            self.next_request_id(),
-            "turn/start",
-            Some(json!({
-                "threadId": thread_id,
-                "message": prompt
-            })),
-        );
-        self.process
-            .send(&serde_json::to_value(&req).unwrap())
-            .await?;
-
-        loop {
-            let msg = match self.process.recv().await? {
-                Some(msg) => msg,
-                None => return Ok(TurnResult::AgentExited),
-            };
-
-            if let Some(id) = msg.get("id").and_then(|v| v.as_u64())
-                && id == req.id {
-                    self.turn_id = msg
-                        .get("result")
-                        .and_then(|r| r.get("turnId"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    continue;
-                }
-
-            if let Some(method) = msg.get("method").and_then(|v| v.as_str())
-                && method == "turn/event"
-                    && let Some(params) = msg.get("params") {
-                        match serde_json::from_value::<TurnEvent>(params.clone()) {
-                            Ok(TurnEvent::TurnComplete { .. }) => {
-                                return Ok(TurnResult::Complete);
-                            }
-                            Ok(TurnEvent::ToolCall {
-                                id,
-                                name,
-                                arguments,
-                            }) => {
-                                if tools::is_client_tool(&name) {
-                                    return Ok(TurnResult::NeedsToolResponse {
-                                        tool_call_id: id,
-                                        tool_name: name,
-                                        arguments,
-                                    });
-                                }
-                            }
-                            Ok(TurnEvent::Error { message }) => {
-                                return Ok(TurnResult::Error(message));
-                            }
-                            Ok(TurnEvent::TextDelta { delta }) => {
-                                tracing::trace!(issue_id = %self.issue_id, "text: {delta}");
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::warn!("failed to parse turn event: {e}");
-                            }
-                        }
-                    }
-        }
-    }
-
-    /// Send a tool response back to the agent.
-    pub async fn send_tool_response(&mut self, tool_call_id: &str, result: Value) -> Result<()> {
-        let req = JsonRpcRequest::new(
-            self.next_request_id(),
-            "turn/toolResponse",
-            Some(json!({
-                "toolCallId": tool_call_id,
-                "content": result
-            })),
-        );
-        self.process
-            .send(&serde_json::to_value(&req).unwrap())
-            .await?;
-        Ok(())
-    }
-
-    /// Read a JSON-RPC response with the given ID, skipping notifications.
-    async fn read_response(&mut self, expected_id: u64) -> Result<Value> {
-        loop {
-            let msg = self
-                .process
-                .recv()
-                .await?
-                .ok_or_else(|| {
-                    Error::AgentProtocol("agent process exited during handshake".into())
-                })?;
-
-            if let Some(id) = msg.get("id").and_then(|v| v.as_u64())
-                && id == expected_id {
-                    if let Some(error) = msg.get("error") {
-                        return Err(Error::AgentProtocol(format!("agent error: {error}")));
-                    }
-                    return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
-                }
-        }
     }
 
     pub async fn kill(&mut self) -> Result<()> {
@@ -194,45 +28,160 @@ impl AgentWorker {
     }
 }
 
-/// Run a full agent attempt: multiple turns until completion or max_turns.
+/// Result of a streamed event from the agent.
+#[derive(Debug)]
+pub enum StreamEvent {
+    /// Agent sent a text message
+    AssistantText(String),
+    /// Agent is using a tool
+    ToolUse { name: String, input: String },
+    /// Agent finished successfully
+    Result { result: String, cost_usd: f64, num_turns: u64 },
+    /// Agent errored
+    Error(String),
+    /// Process exited
+    Eof,
+}
+
+/// Run the agent to completion, streaming events back to state.
 pub async fn run_agent_attempt(
     worker: &mut AgentWorker,
-    initial_prompt: &str,
-    max_turns: u32,
+    _initial_prompt: &str,
+    _max_turns: u32,
+    state: &crate::domain::state::OrchestratorState,
+    issue_id: &str,
 ) -> Result<bool> {
-    let mut turn = 0u32;
-    let mut prompt = initial_prompt.to_string();
+    use crate::domain::session::{AgentEvent, AgentEventKind};
 
     loop {
-        if turn >= max_turns {
-            tracing::warn!("max turns ({max_turns}) reached");
-            return Ok(false);
-        }
+        let msg = match worker.process.recv().await? {
+            Some(msg) => msg,
+            None => {
+                state.push_agent_event(
+                    issue_id,
+                    AgentEvent::now(AgentEventKind::Error {
+                        message: "agent process exited".into(),
+                    }),
+                );
+                return Err(Error::Agent("agent process exited unexpectedly".into()));
+            }
+        };
 
-        let result = worker.run_turn(&prompt).await?;
-        turn += 1;
+        let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-        match result {
-            TurnResult::Complete => {
-                tracing::info!(turn, "agent completed successfully");
+        match msg_type {
+            "system" => {
+                let subtype = msg.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+                if subtype == "init" {
+                    state.push_agent_event(
+                        issue_id,
+                        AgentEvent::now(AgentEventKind::Status {
+                            status: "Agent initialized".into(),
+                        }),
+                    );
+                    state.update_session_status(
+                        issue_id,
+                        crate::domain::session::RunStatus::Running,
+                    );
+                }
+            }
+            "assistant" => {
+                // Extract tool use or text from the message
+                if let Some(message) = msg.get("message")
+                    && let Some(content) = message.get("content").and_then(|v| v.as_array())
+                {
+                        for block in content {
+                            let block_type =
+                                block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            match block_type {
+                                "text" => {
+                                    if let Some(text) = block.get("text").and_then(|v| v.as_str())
+                                    {
+                                        let preview: String = text.chars().take(300).collect();
+                                        state.push_agent_event(
+                                            issue_id,
+                                            AgentEvent::now(AgentEventKind::Text {
+                                                text: preview,
+                                            }),
+                                        );
+                                    }
+                                }
+                                "tool_use" => {
+                                    let name = block
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unknown");
+                                    let input = block
+                                        .get("input")
+                                        .map(|v| v.to_string())
+                                        .unwrap_or_default();
+                                    let truncated: String = input.chars().take(200).collect();
+                                    state.push_agent_event(
+                                        issue_id,
+                                        AgentEvent::now(AgentEventKind::ToolCall {
+                                            name: name.to_string(),
+                                            arguments: truncated,
+                                        }),
+                                    );
+                                    state.increment_turn(issue_id);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            "result" => {
+                let is_error = msg.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                let result_text = msg
+                    .get("result")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let cost = msg
+                    .get("total_cost_usd")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let num_turns = msg
+                    .get("num_turns")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+
+                if is_error {
+                    state.push_agent_event(
+                        issue_id,
+                        AgentEvent::now(AgentEventKind::Error {
+                            message: result_text.clone(),
+                        }),
+                    );
+                    return Err(Error::Agent(result_text));
+                }
+
+                state.push_agent_event(
+                    issue_id,
+                    AgentEvent::now(AgentEventKind::TurnComplete {
+                        turn: num_turns as u32,
+                    }),
+                );
+                state.push_agent_event(
+                    issue_id,
+                    AgentEvent::now(AgentEventKind::Status {
+                        status: format!(
+                            "Completed in {num_turns} turns (${:.4})",
+                            cost
+                        ),
+                    }),
+                );
+
+                tracing::info!(
+                    issue_id,
+                    num_turns,
+                    cost_usd = cost,
+                    "agent completed"
+                );
                 return Ok(true);
             }
-            TurnResult::NeedsToolResponse {
-                tool_call_id,
-                tool_name,
-                arguments,
-            } => {
-                let tool_result = tools::handle_tool_call(&tool_name, &arguments).await?;
-                worker.send_tool_response(&tool_call_id, tool_result).await?;
-                prompt = "Continue with the tool result.".to_string();
-            }
-            TurnResult::Error(msg) => {
-                tracing::error!(turn, "agent error: {msg}");
-                return Err(Error::Agent(msg));
-            }
-            TurnResult::AgentExited => {
-                tracing::warn!(turn, "agent process exited unexpectedly");
-                return Err(Error::Agent("agent process exited".into()));
+            _ => {
+                // Skip unknown event types (hook events, etc.)
             }
         }
     }

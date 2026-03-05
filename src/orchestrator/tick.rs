@@ -99,8 +99,9 @@ fn dispatch_issue(
     let config_rx = config_rx.clone();
     let event_tx = event_tx.clone();
 
+    let state_clone = state.clone();
     tokio::spawn(async move {
-        let result = run_worker(&issue, &config, &config_rx, None).await;
+        let result = run_worker(&issue, &config, &config_rx, None, &state_clone).await;
 
         let (success, error) = match &result {
             Ok(true) => (true, None),
@@ -129,7 +130,7 @@ fn dispatch_issue(
 /// Spawn a worker task for a retry.
 fn dispatch_retry(
     retry: RetryEntry,
-    _state: &OrchestratorState,
+    state: &OrchestratorState,
     config: &ServiceConfig,
     config_rx: &watch::Receiver<ServiceConfig>,
     event_tx: &mpsc::Sender<OrchestratorEvent>,
@@ -143,6 +144,7 @@ fn dispatch_retry(
     let config = config.clone();
     let config_rx = config_rx.clone();
     let event_tx = event_tx.clone();
+    let state_clone = state.clone();
     let attempt = retry.attempt;
 
     tokio::spawn(async move {
@@ -168,7 +170,7 @@ fn dispatch_retry(
             return;
         };
 
-        let result = run_worker(&issue, &config, &config_rx, Some(attempt)).await;
+        let result = run_worker(&issue, &config, &config_rx, Some(attempt), &state_clone).await;
 
         let (success, error) = match &result {
             Ok(true) => (true, None),
@@ -200,10 +202,20 @@ async fn run_worker(
     config: &ServiceConfig,
     config_rx: &watch::Receiver<ServiceConfig>,
     attempt: Option<u32>,
+    state: &OrchestratorState,
 ) -> Result<bool> {
+    use crate::domain::session::{AgentEvent, AgentEventKind, RunStatus};
+    use crate::workspace::hooks;
+
     let ws = WorkspaceManager::new(config_rx.clone());
 
     // Ensure workspace exists (creates + runs after_create hook if new)
+    state.push_agent_event(
+        &issue.identifier,
+        AgentEvent::now(AgentEventKind::Status {
+            status: "Setting up workspace".into(),
+        }),
+    );
     let workspace_dir = ws.ensure(issue).await?;
 
     // Run before_run hook
@@ -213,19 +225,165 @@ async fn run_worker(
     let prompt_text = prompt::build_prompt(&config.prompt_template, issue, attempt)?;
 
     // Start agent session
+    state.push_agent_event(
+        &issue.identifier,
+        AgentEvent::now(AgentEventKind::Status {
+            status: "Starting agent".into(),
+        }),
+    );
+    state.update_session_status(&issue.identifier, RunStatus::Running);
+
     let runner = agent::AgentRunner::new(config.clone());
     let mut worker = runner
         .start_session(&workspace_dir, &prompt_text, &issue.identifier)
         .await?;
 
     // Run multi-turn agent loop
-    let success = run_agent_attempt(&mut worker, &prompt_text, config.agent.max_turns).await?;
+    let success =
+        run_agent_attempt(&mut worker, &prompt_text, config.agent.max_turns, state, &issue.identifier).await?;
+
+    if success {
+        // Post-completion pipeline: commit → review → PR
+        let hook_timeout = config.hooks.timeout();
+
+        // 1. Commit the agent's changes
+        state.push_agent_event(
+            &issue.identifier,
+            AgentEvent::now(AgentEventKind::Status {
+                status: "Committing agent changes".into(),
+            }),
+        );
+        let title_safe = issue.title.replace('\'', "'\\''");
+        let commit_script = format!(
+            "git add -A && git diff --cached --quiet || git commit -m 'fix: {}'",
+            title_safe,
+        );
+        if let Err(e) = hooks::run_hook(&commit_script, &workspace_dir, hook_timeout).await {
+            tracing::warn!(issue_id = issue.identifier, "commit hook failed: {e}");
+        }
+
+        // 2. Run review agent
+        state.push_agent_event(
+            &issue.identifier,
+            AgentEvent::now(AgentEventKind::Status {
+                status: "Running deep review".into(),
+            }),
+        );
+        let review_prompt = build_review_prompt(issue);
+        match runner
+            .start_session(&workspace_dir, &review_prompt, &issue.identifier)
+            .await
+        {
+            Ok(mut review_worker) => {
+                match run_agent_attempt(
+                    &mut review_worker,
+                    &review_prompt,
+                    config.agent.max_turns,
+                    state,
+                    &issue.identifier,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        // Commit review fixes if any
+                        let review_commit =
+                            "git add -A && git diff --cached --quiet || git commit -m 'review: address code review feedback'";
+                        if let Err(e) =
+                            hooks::run_hook(review_commit, &workspace_dir, hook_timeout).await
+                        {
+                            tracing::warn!(
+                                issue_id = issue.identifier,
+                                "review commit failed: {e}"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            issue_id = issue.identifier,
+                            "review agent failed: {e}"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    issue_id = issue.identifier,
+                    "failed to start review agent: {e}"
+                );
+            }
+        }
+
+        // 3. Push branch and open draft PR
+        state.push_agent_event(
+            &issue.identifier,
+            AgentEvent::now(AgentEventKind::Status {
+                status: "Opening draft PR".into(),
+            }),
+        );
+        let pr_title = format!("Bug {}: {}", issue.identifier, issue.title)
+            .replace('\'', "'\\''");
+        let pr_body_text = format!(
+            "Automated fix for bug **{}**: {}\n\n---\n*Opened by Symposium*",
+            issue.identifier, issue.title,
+        )
+        .replace('\'', "'\\''");
+        let pr_script = format!(
+            "git push -u origin HEAD 2>&1 && gh pr create --draft --title '{}' --body '{}' 2>&1 || true",
+            pr_title, pr_body_text,
+        );
+        match hooks::run_hook(&pr_script, &workspace_dir, hook_timeout).await {
+            Ok(()) => {
+                tracing::info!(issue_id = issue.identifier, "draft PR created");
+                state.push_agent_event(
+                    &issue.identifier,
+                    AgentEvent::now(AgentEventKind::Status {
+                        status: "Draft PR opened".into(),
+                    }),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(issue_id = issue.identifier, "PR creation failed: {e}");
+                state.push_agent_event(
+                    &issue.identifier,
+                    AgentEvent::now(AgentEventKind::Error {
+                        message: format!("PR creation failed: {e}"),
+                    }),
+                );
+            }
+        }
+    }
 
     // Run after_run hook
     ws.finish(issue, success).await?;
 
     Ok(success)
 }
+
+/// Build a review-focused prompt for the second agent pass.
+fn build_review_prompt(issue: &Issue) -> String {
+    format!(
+        r#"You are reviewing changes for bug {id}: {title}.
+
+First, read `CLAUDE.md` at the repo root and any relevant subsystem `AGENTS.md` files.
+
+Then run `git diff origin/main` to see all changes on this branch.
+
+Perform a thorough code review covering:
+
+1. **Correctness** — Does the fix actually address the bug? Are there edge cases or off-by-one errors?
+2. **Error handling** — Are errors handled properly? No swallowed errors or missing error paths?
+3. **Type safety** — Are types used correctly? Any unsafe casts or implicit conversions?
+4. **Performance** — Any unnecessary allocations, N+1 queries, or hot-path regressions?
+5. **Security** — Any injection, XSS, auth bypass, or other vulnerabilities introduced?
+6. **Tests** — Are tests adequate? Do they cover the regression? Are there missing test cases?
+7. **Code quality** — Naming, duplication, dead code, or overly complex logic?
+
+Fix any real issues you find. Keep changes minimal — only fix actual problems, do not refactor working code or make stylistic changes. If no issues are found, do nothing."#,
+        id = issue.identifier,
+        title = issue.title,
+    )
+}
+
 
 /// Clean up workspaces for issues that have reached terminal states.
 async fn cleanup_terminal(

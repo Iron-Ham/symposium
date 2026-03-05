@@ -24,21 +24,29 @@ pub async fn run_hook_with_env(
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| {
+    let child = cmd.spawn().map_err(|e| {
         Error::Hook(format!("failed to spawn hook: {e}"))
     })?;
 
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => {
-            if status.success() {
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => {
+            if output.status.success() {
                 Ok(())
             } else {
-                Err(Error::Hook(format!("hook exited with {status}")))
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if !stderr.is_empty() {
+                    tracing::warn!(stderr = %stderr.trim(), "hook stderr");
+                }
+                if !stdout.is_empty() {
+                    tracing::debug!(stdout = %stdout.trim(), "hook stdout");
+                }
+                Err(Error::Hook(format!("hook exited with {}", output.status)))
             }
         }
         Ok(Err(e)) => Err(Error::Hook(format!("hook I/O error: {e}"))),
         Err(_) => {
-            let _ = child.start_kill();
+            // child was consumed by wait_with_output — process already finished or will be reaped
             Err(Error::Hook(format!(
                 "hook timed out after {}s",
                 timeout.as_secs()
