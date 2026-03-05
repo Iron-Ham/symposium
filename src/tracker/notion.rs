@@ -1,4 +1,5 @@
 use super::mcp::McpClient;
+use super::mcp_http::HttpMcpClient;
 use super::TrackerClient;
 use crate::config::schema::TrackerConfig;
 use crate::domain::issue::Issue;
@@ -6,19 +7,39 @@ use crate::error::{Error, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
+/// Wraps either a stdio or HTTP MCP client.
+enum McpTransport {
+    Stdio(McpClient),
+    Http(HttpMcpClient),
+}
+
+impl McpTransport {
+    async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value> {
+        match self {
+            Self::Stdio(c) => c.call_tool(name, args).await,
+            Self::Http(c) => c.call_tool(name, args).await,
+        }
+    }
+}
+
 pub struct NotionTracker {
-    client: McpClient,
+    client: McpTransport,
     config: TrackerConfig,
     data_source_id: Option<String>,
 }
 
 impl NotionTracker {
     pub async fn new(config: TrackerConfig) -> Result<Self> {
-        let parts: Vec<&str> = config.mcp_command.split_whitespace().collect();
-        let (cmd, args) = parts
-            .split_first()
-            .ok_or_else(|| Error::Tracker("empty mcp_command".into()))?;
-        let client = McpClient::new(cmd, args).await?;
+        let client = if let Some(ref url) = config.mcp_url {
+            tracing::info!(url, "connecting to MCP via HTTP");
+            McpTransport::Http(HttpMcpClient::new(url).await?)
+        } else {
+            let parts: Vec<&str> = config.mcp_command.split_whitespace().collect();
+            let (cmd, args) = parts
+                .split_first()
+                .ok_or_else(|| Error::Tracker("empty mcp_command".into()))?;
+            McpTransport::Stdio(McpClient::new(cmd, args).await?)
+        };
         Ok(Self {
             client,
             config,
@@ -26,19 +47,14 @@ impl NotionTracker {
         })
     }
 
-    /// Discover the data source ID for the configured database.
-    async fn ensure_data_source(&mut self) -> Result<String> {
+    /// Get the data source URL for the configured database.
+    fn data_source_url(&mut self) -> String {
         if let Some(ref id) = self.data_source_id {
-            return Ok(id.clone());
+            return id.clone();
         }
-        // Query data sources to find our database
-        let _result = self
-            .client
-            .call_tool("notion-query-data-sources", serde_json::json!({"query": ""}))
-            .await?;
         let ds_id = format!("collection://{}", self.config.database_id);
         self.data_source_id = Some(ds_id.clone());
-        Ok(ds_id)
+        ds_id
     }
 
     /// Build SQL query for fetching issues with given statuses.
@@ -54,16 +70,34 @@ impl NotionTracker {
         )
     }
 
+    /// Unwrap the MCP tool response to get the inner data.
+    /// MCP tools return `{"content": [{"type":"text","text":"{...}"}]}`.
+    fn unwrap_tool_result(result: &Value) -> Value {
+        // Try to extract text from MCP content blocks
+        if let Some(content) = result.get("content").and_then(|v| v.as_array()) {
+            for block in content {
+                if let Some(text) = block.get("text").and_then(|v| v.as_str())
+                    && let Ok(parsed) = serde_json::from_str::<Value>(text)
+                {
+                    return parsed;
+                }
+            }
+        }
+        // Already unwrapped or direct format
+        result.clone()
+    }
+
     /// Extract Issue structs from a Notion query result.
     fn extract_issues(&self, result: &Value) -> Vec<Issue> {
+        let data = Self::unwrap_tool_result(result);
         let mut issues = Vec::new();
 
-        let rows = result
+        let rows = data
             .get("results")
-            .or_else(|| result.get("content"))
             .and_then(|v| v.as_array());
 
         let Some(rows) = rows else {
+            tracing::debug!(response = %data, "no results array in response");
             return issues;
         };
 
@@ -72,6 +106,8 @@ impl NotionTracker {
                 issues.push(issue);
             }
         }
+
+        tracing::info!(count = issues.len(), "fetched issues from Notion");
         issues
     }
 
@@ -191,13 +227,18 @@ impl NotionTracker {
 
 impl TrackerClient for NotionTracker {
     async fn fetch_candidate_issues(&mut self) -> Result<Vec<Issue>> {
-        let ds_id = self.ensure_data_source().await?;
-        let sql = self.build_status_query(&ds_id, &self.config.active_states);
+        let ds_url = self.data_source_url();
+        let sql = self.build_status_query(&ds_url, &self.config.active_states);
         let result = self
             .client
             .call_tool(
                 "notion-query-data-sources",
-                serde_json::json!({"query": sql}),
+                serde_json::json!({
+                    "data": {
+                        "data_source_urls": [&ds_url],
+                        "query": sql
+                    }
+                }),
             )
             .await?;
         Ok(self.extract_issues(&result))
@@ -225,23 +266,34 @@ impl TrackerClient for NotionTracker {
     }
 
     async fn fetch_terminal_issues(&mut self) -> Result<Vec<Issue>> {
-        let ds_id = self.ensure_data_source().await?;
-        let sql = self.build_status_query(&ds_id, &self.config.terminal_states);
+        let ds_url = self.data_source_url();
+        let sql = self.build_status_query(&ds_url, &self.config.terminal_states);
         let result = self
             .client
             .call_tool(
                 "notion-query-data-sources",
-                serde_json::json!({"query": sql}),
+                serde_json::json!({
+                    "data": {
+                        "data_source_urls": [&ds_url],
+                        "query": sql
+                    }
+                }),
             )
             .await?;
         Ok(self.extract_issues(&result))
     }
 
     async fn agent_query(&mut self, sql: &str) -> Result<Value> {
+        let ds_url = self.data_source_url();
         self.client
             .call_tool(
                 "notion-query-data-sources",
-                serde_json::json!({"query": sql}),
+                serde_json::json!({
+                    "data": {
+                        "data_source_urls": [&ds_url],
+                        "query": sql
+                    }
+                }),
             )
             .await
     }

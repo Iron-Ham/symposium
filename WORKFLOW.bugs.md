@@ -1,7 +1,7 @@
 ---
 tracker:
   kind: notion
-  mcp_command: "npx -y @notionhq/notion-mcp-server"
+  mcp_url: "https://mcp-dev.notion.com/readonly"
   database_id: "1cfb35e6-e67f-8168-bc1e-000b75bfd45a"
   active_states: ["On Deck", "In Progress", "Backlog"]
   terminal_states: ["Fixed", "Won't Fix", "Can't Fix", "No Longer Relevant", "Expected Behavior"]
