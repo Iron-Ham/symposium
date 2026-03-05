@@ -33,6 +33,8 @@ pub struct TrackerConfig {
     pub property_assignee: String,
     /// Filter issues to only those assigned to this user ID.
     pub assignee_user_id: Option<String>,
+    /// Skip issues where this property is non-null (e.g. a linked PR relation).
+    pub skip_if_set: Option<String>,
 }
 
 impl Default for TrackerConfig {
@@ -51,6 +53,7 @@ impl Default for TrackerConfig {
             property_description: "Description".to_string(),
             property_assignee: "Assignee".to_string(),
             assignee_user_id: None,
+            skip_if_set: None,
         }
     }
 }
@@ -117,14 +120,12 @@ impl HooksConfig {
 #[serde(default)]
 pub struct AgentConfig {
     pub max_concurrent_agents: usize,
-    pub max_turns: u32,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_concurrent_agents: 5,
-            max_turns: 20,
         }
     }
 }

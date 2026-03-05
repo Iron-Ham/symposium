@@ -59,12 +59,11 @@ pub fn render(snapshot: &StateSnapshot) -> String {
                 })
                 .unwrap_or_default();
             format!(
-                "<tr><td><a href=\"/issue/{}\">{}</a></td><td>{}</td><td>{:?}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td><a href=\"/issue/{}\">{}</a></td><td>{}</td><td>{:?}</td><td>{}</td></tr>",
                 entry.issue.identifier,
                 entry.issue.identifier,
                 html_escape(&entry.issue.title),
                 entry.session.status,
-                entry.session.current_turn,
                 html_escape(&last_event),
             )
         })
@@ -132,7 +131,7 @@ pub fn render(snapshot: &StateSnapshot) -> String {
         running_table = if snapshot.running.is_empty() {
             "<div class=\"empty\">No running sessions</div>".to_string()
         } else {
-            format!("<table><tr><th>Issue</th><th>Title</th><th>Status</th><th>Turns</th><th>Latest</th></tr>{running_rows}</table>")
+            format!("<table><tr><th>Issue</th><th>Title</th><th>Status</th><th>Latest</th></tr>{running_rows}</table>")
         },
         completed_table = if snapshot.completed.is_empty() {
             "<div class=\"empty\">No completed sessions yet</div>".to_string()
@@ -158,7 +157,6 @@ pub fn render_issue_detail(snapshot: &StateSnapshot, issue_id: &str) -> String {
         .session
         .events
         .iter()
-        .rev()
         .map(|event| {
             let time = event.timestamp.format("%H:%M:%S");
             match &event.kind {
@@ -225,7 +223,6 @@ pub fn render_issue_detail(snapshot: &StateSnapshot, issue_id: &str) -> String {
 
     <div class="meta">
         <div class="meta-row"><span class="meta-label">Status</span><span>{status:?}</span></div>
-        <div class="meta-row"><span class="meta-label">Turn</span><span>{turn}</span></div>
         <div class="meta-row"><span class="meta-label">Priority</span><span>{priority}</span></div>
         <div class="meta-row"><span class="meta-label">Started</span><span>{started}</span></div>
         <div class="meta-row"><span class="meta-label">Last Activity</span><span>{last_activity}</span></div>
@@ -243,7 +240,6 @@ pub fn render_issue_detail(snapshot: &StateSnapshot, issue_id: &str) -> String {
         id = entry.issue.identifier,
         title = html_escape(&entry.issue.title),
         status = entry.session.status,
-        turn = entry.session.current_turn,
         priority = html_escape(entry.issue.priority.as_deref().unwrap_or("—")),
         started = entry.session.started_at.format("%H:%M:%S"),
         last_activity = entry.session.last_activity.format("%H:%M:%S"),

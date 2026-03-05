@@ -74,6 +74,9 @@ impl NotionTracker {
                 self.config.property_assignee
             ));
         }
+        if let Some(ref prop) = self.config.skip_if_set {
+            query.push_str(&format!(" AND \"{prop}\" IS NULL"));
+        }
         query
     }
 

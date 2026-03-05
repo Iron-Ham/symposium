@@ -7,7 +7,6 @@ const MAX_EVENTS: usize = 200;
 pub struct LiveSession {
     pub issue_id: String,
     pub thread_id: Option<String>,
-    pub current_turn: u32,
     pub status: RunStatus,
     pub started_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
@@ -21,7 +20,6 @@ impl LiveSession {
         Self {
             issue_id,
             thread_id: None,
-            current_turn: 0,
             status: RunStatus::Starting,
             started_at: now,
             last_activity: now,

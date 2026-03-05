@@ -172,13 +172,6 @@ impl OrchestratorState {
         }
     }
 
-    pub fn increment_turn(&self, issue_id: &str) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(entry) = inner.running.get_mut(issue_id) {
-            entry.session.current_turn += 1;
-            entry.session.last_activity = Utc::now();
-        }
-    }
 
     pub fn snapshot(&self) -> StateSnapshot {
         let inner = self.inner.lock().unwrap();
