@@ -234,7 +234,19 @@ pub fn render_issue_detail(snapshot: &StateSnapshot, issue_id: &str) -> String {
         {events}
     </div>
 
-    <script>setTimeout(() => location.reload(), 3000);</script>
+    <script>
+    (() => {{
+        const el = document.querySelector('.events-container');
+        if (!el) return;
+        const wasAtBottom = sessionStorage.getItem('eventsAtBottom') !== 'false';
+        if (wasAtBottom) el.scrollTop = el.scrollHeight;
+        setTimeout(() => {{
+            const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
+            sessionStorage.setItem('eventsAtBottom', atBottom);
+            location.reload();
+        }}, 3000);
+    }})();
+    </script>
 </body>
 </html>"#,
         id = entry.issue.identifier,

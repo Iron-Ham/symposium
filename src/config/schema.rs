@@ -80,12 +80,15 @@ impl PollingConfig {
 #[serde(default)]
 pub struct WorkspaceConfig {
     pub root: String,
+    /// Subdirectory within the workspace to use as the agent's working directory.
+    pub agent_subdirectory: Option<String>,
 }
 
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
             root: "~/symposium_workspaces".to_string(),
+            agent_subdirectory: None,
         }
     }
 }
