@@ -302,9 +302,10 @@ async fn run_worker(
             "Automated fix for bug **{}**: {}\n\n---\n*Opened by Symposium*",
             issue.identifier, issue.title,
         );
-        // Write title/body to temp files to avoid shell escaping issues with special characters
-        let title_file = workspace_dir.join(".symposium-pr-title");
-        let body_file = workspace_dir.join(".symposium-pr-body");
+        // Write title/body to temp files outside the workspace to avoid accidental git add
+        let tmp = std::env::temp_dir();
+        let title_file = tmp.join(format!("symposium-pr-title-{}", issue.identifier));
+        let body_file = tmp.join(format!("symposium-pr-body-{}", issue.identifier));
         let _ = tokio::fs::write(&title_file, &pr_title).await;
         let _ = tokio::fs::write(&body_file, &pr_body_text).await;
         let pr_script = format!(
