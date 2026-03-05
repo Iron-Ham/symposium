@@ -233,9 +233,15 @@ async fn run_worker(
     );
     state.update_session_status(&issue.identifier, RunStatus::Running);
 
+    // Use agent_subdirectory if configured (e.g. "mail-ios" within the repo worktree)
+    let agent_dir = match &config.workspace.agent_subdirectory {
+        Some(sub) => workspace_dir.join(sub),
+        None => workspace_dir.clone(),
+    };
+
     let runner = agent::AgentRunner::new(config.clone());
     let mut worker = runner
-        .start_session(&workspace_dir, &prompt_text, &issue.identifier)
+        .start_session(&agent_dir, &prompt_text, &issue.identifier)
         .await?;
 
     // Run multi-turn agent loop
@@ -255,7 +261,7 @@ async fn run_worker(
         );
         let review_prompt = build_review_prompt(issue);
         match runner
-            .start_session(&workspace_dir, &review_prompt, &issue.identifier)
+            .start_session(&agent_dir, &review_prompt, &issue.identifier)
             .await
         {
             Ok(mut review_worker) => {
