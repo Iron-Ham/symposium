@@ -75,39 +75,34 @@ impl NotionTracker {
         issues
     }
 
-    /// Strip known prefixes like `userDefined:` from property names.
-    fn resolve_property_name(name: &str) -> &str {
-        name.strip_prefix("userDefined:").unwrap_or(name)
-    }
-
     fn parse_issue_row(&self, row: &Value) -> Option<Issue> {
         let props = row.get("properties").or(Some(row));
 
-        let id_prop = Self::resolve_property_name(&self.config.property_id);
-        let status_prop = Self::resolve_property_name(&self.config.property_status);
-        let priority_prop = Self::resolve_property_name(&self.config.property_priority);
+        let id_prop = self.config.property_id.as_str();
+        let title_prop = self.config.property_title.as_str();
+        let status_prop = self.config.property_status.as_str();
+        let priority_prop = self.config.property_priority.as_str();
+        let desc_prop = self.config.property_description.as_str();
 
         let identifier = self.extract_property(props?, id_prop)?;
-        let title = self
-            .extract_property(props?, "Name")
-            .or_else(|| self.extract_property(props?, "Title"))
-            .unwrap_or_default();
+        let title = self.extract_property(props?, title_prop).unwrap_or_default();
         let status = self
             .extract_property(props?, status_prop)
             .unwrap_or_default();
         let priority = self.extract_property(props?, priority_prop);
+        let description = self.extract_property(props?, desc_prop);
         let page_id = row.get("id").and_then(|v| v.as_str()).map(String::from);
         let url = row.get("url").and_then(|v| v.as_str()).map(String::from);
 
         // Collect extra properties not already mapped to known fields
         let known: HashSet<&str> =
-            [id_prop, status_prop, priority_prop, "Name", "Title"].into();
+            [id_prop, title_prop, status_prop, priority_prop, desc_prop].into();
         let extra = self.extract_extra_properties(props?, &known);
 
         Some(Issue {
             identifier,
             title,
-            description: None,
+            description,
             status,
             priority,
             url,
