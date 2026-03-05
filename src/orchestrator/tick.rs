@@ -246,23 +246,7 @@ async fn run_worker(
         // Post-completion pipeline: commit → review → PR
         let hook_timeout = config.hooks.timeout();
 
-        // 1. Commit the agent's changes
-        state.push_agent_event(
-            &issue.identifier,
-            AgentEvent::now(AgentEventKind::Status {
-                status: "Committing agent changes".into(),
-            }),
-        );
-        let title_safe = issue.title.replace('\'', "'\\''");
-        let commit_script = format!(
-            "git add -A && git diff --cached --quiet || git commit -m 'fix: {}'",
-            title_safe,
-        );
-        if let Err(e) = hooks::run_hook(&commit_script, &workspace_dir, hook_timeout).await {
-            tracing::warn!(issue_id = issue.identifier, "commit hook failed: {e}");
-        }
-
-        // 2. Run review agent
+        // 1. Run review agent
         state.push_agent_event(
             &issue.identifier,
             AgentEvent::now(AgentEventKind::Status {
@@ -283,19 +267,7 @@ async fn run_worker(
                 )
                 .await
                 {
-                    Ok(_) => {
-                        // Commit review fixes if any
-                        let review_commit =
-                            "git add -A && git diff --cached --quiet || git commit -m 'review: address code review feedback'";
-                        if let Err(e) =
-                            hooks::run_hook(review_commit, &workspace_dir, hook_timeout).await
-                        {
-                            tracing::warn!(
-                                issue_id = issue.identifier,
-                                "review commit failed: {e}"
-                            );
-                        }
-                    }
+                    Ok(_) => {}
                     Err(e) => {
                         tracing::warn!(
                             issue_id = issue.identifier,
@@ -319,16 +291,20 @@ async fn run_worker(
                 status: "Opening draft PR".into(),
             }),
         );
-        let pr_title = format!("[BUG-{}] {}", issue.identifier, issue.title)
-            .replace('\'', "'\\''");
+        let pr_title = format!("[BUG-{}] {}", issue.identifier, issue.title);
         let pr_body_text = format!(
             "Automated fix for bug **{}**: {}\n\n---\n*Opened by Symposium*",
             issue.identifier, issue.title,
-        )
-        .replace('\'', "'\\''");
+        );
+        // Write title/body to temp files to avoid shell escaping issues with special characters
+        let title_file = workspace_dir.join(".symposium-pr-title");
+        let body_file = workspace_dir.join(".symposium-pr-body");
+        let _ = tokio::fs::write(&title_file, &pr_title).await;
+        let _ = tokio::fs::write(&body_file, &pr_body_text).await;
         let pr_script = format!(
-            "git push -u origin HEAD 2>&1 && gh pr create --draft --title '{}' --body '{}' 2>&1 || true",
-            pr_title, pr_body_text,
+            "git push -u origin HEAD 2>&1 && gh pr create --draft --title \"$(cat {})\" --body-file {} 2>&1",
+            title_file.display(),
+            body_file.display(),
         );
         match hooks::run_hook(&pr_script, &workspace_dir, hook_timeout).await {
             Ok(()) => {
@@ -350,6 +326,9 @@ async fn run_worker(
                 );
             }
         }
+        // Clean up temp files
+        let _ = tokio::fs::remove_file(&title_file).await;
+        let _ = tokio::fs::remove_file(&body_file).await;
     }
 
     // Run after_run hook
@@ -377,7 +356,9 @@ Perform a thorough code review covering:
 6. **Tests** — Are tests adequate? Do they cover the regression? Are there missing test cases?
 7. **Code quality** — Naming, duplication, dead code, or overly complex logic?
 
-Fix any real issues you find. Keep changes minimal — only fix actual problems, do not refactor working code or make stylistic changes. If no issues are found, do nothing."#,
+Fix any real issues you find. Keep changes minimal — only fix actual problems, do not refactor working code or make stylistic changes. If no issues are found, do nothing.
+
+If you made any changes, commit them with `git add` and `git commit` with a descriptive message."#,
         id = issue.identifier,
         title = issue.title,
     )
