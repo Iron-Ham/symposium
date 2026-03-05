@@ -204,10 +204,10 @@ async fn run_worker(
     let ws = WorkspaceManager::new(config_rx.clone());
 
     // Ensure workspace exists (creates + runs after_create hook if new)
-    let workspace_dir = ws.ensure(&issue.identifier).await?;
+    let workspace_dir = ws.ensure(issue).await?;
 
     // Run before_run hook
-    ws.prepare(&issue.identifier).await?;
+    ws.prepare(issue, attempt).await?;
 
     // Build prompt from template
     let prompt_text = prompt::build_prompt(&config.prompt_template, issue, attempt)?;
@@ -222,7 +222,7 @@ async fn run_worker(
     let success = run_agent_attempt(&mut worker, &prompt_text, config.agent.max_turns).await?;
 
     // Run after_run hook
-    ws.finish(&issue.identifier, success).await?;
+    ws.finish(issue, success).await?;
 
     Ok(success)
 }
