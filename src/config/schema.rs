@@ -25,8 +25,10 @@ pub struct TrackerConfig {
     pub active_states: Vec<String>,
     pub terminal_states: Vec<String>,
     pub property_id: String,
+    pub property_title: String,
     pub property_status: String,
     pub property_priority: String,
+    pub property_description: String,
 }
 
 impl Default for TrackerConfig {
@@ -38,8 +40,10 @@ impl Default for TrackerConfig {
             active_states: vec!["Todo".to_string(), "In Progress".to_string()],
             terminal_states: vec!["Done".to_string(), "Cancelled".to_string()],
             property_id: "ID".to_string(),
+            property_title: "Name".to_string(),
             property_status: "Status".to_string(),
             property_priority: "Priority".to_string(),
+            property_description: "Description".to_string(),
         }
     }
 }
