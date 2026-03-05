@@ -12,15 +12,22 @@ pub fn build_prompt(template_str: &str, issue: &Issue, attempt: Option<u32>) -> 
         .parse(template_str)
         .map_err(|e| Error::Prompt(format!("failed to parse template: {e}")))?;
 
+    let mut issue_obj = liquid::object!({
+        "identifier": issue.identifier,
+        "title": issue.title,
+        "description": issue.description.as_deref().unwrap_or(""),
+        "status": issue.status,
+        "priority": issue.priority.as_deref().unwrap_or(""),
+        "url": issue.url.as_deref().unwrap_or(""),
+    });
+
+    // Merge extra properties so templates can use e.g. {{ issue.platform }}
+    for (key, val) in &issue.extra {
+        issue_obj.insert(key.clone().into(), liquid::model::Value::scalar(val.clone()));
+    }
+
     let mut globals = liquid::object!({
-        "issue": {
-            "identifier": issue.identifier,
-            "title": issue.title,
-            "description": issue.description.as_deref().unwrap_or(""),
-            "status": issue.status,
-            "priority": issue.priority.as_deref().unwrap_or(""),
-            "url": issue.url.as_deref().unwrap_or(""),
-        }
+        "issue": issue_obj,
     });
 
     if let Some(attempt) = attempt {
@@ -38,6 +45,7 @@ pub fn build_prompt(template_str: &str, issue: &Issue, attempt: Option<u32>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_basic_render() {
@@ -50,6 +58,7 @@ mod tests {
             url: Some("https://notion.so/page".to_string()),
             notion_page_id: Some("abc123".to_string()),
             blockers: vec![],
+            extra: HashMap::new(),
         };
 
         let template = "Work on {{ issue.identifier }}: {{ issue.title }}\n{{ issue.description }}";
@@ -68,11 +77,33 @@ mod tests {
             url: None,
             notion_page_id: None,
             blockers: vec![],
+            extra: HashMap::new(),
         };
 
         let template = "{% if attempt %}Retry #{{ attempt }}{% endif %} {{ issue.identifier }}";
         let result = build_prompt(template, &issue, Some(3)).unwrap();
         assert!(result.contains("Retry #3"));
         assert!(result.contains("TASK-456"));
+    }
+
+    #[test]
+    fn test_extra_properties_render() {
+        let mut extra = HashMap::new();
+        extra.insert("platform".to_string(), "iOS".to_string());
+        let issue = Issue {
+            identifier: "BUG-1".to_string(),
+            title: "Crash".to_string(),
+            description: None,
+            status: "On Deck".to_string(),
+            priority: Some("P1".to_string()),
+            url: None,
+            notion_page_id: None,
+            blockers: vec![],
+            extra,
+        };
+
+        let template = "Platform: {{ issue.platform }}";
+        let result = build_prompt(template, &issue, None).unwrap();
+        assert_eq!(result, "Platform: iOS");
     }
 }
