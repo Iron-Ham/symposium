@@ -137,8 +137,12 @@ fn dispatch_retry(
 ) {
     let issue_id = retry.issue_id.clone();
 
-    // We need the issue data — check if we still have it in completed or re-fetch
-    // For retries, we'll create a minimal issue from the retry entry
+    // Guard: don't dispatch a retry if the issue is still running (e.g. stale retry entry)
+    if state.is_running(&issue_id) {
+        tracing::warn!(issue_id, "skipping retry — session still running");
+        return;
+    }
+
     tracing::info!(issue_id, attempt = retry.attempt, "dispatching retry");
 
     let config = config.clone();
