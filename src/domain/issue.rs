@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Issue {
@@ -11,6 +12,9 @@ pub struct Issue {
     pub url: Option<String>,
     pub notion_page_id: Option<String>,
     pub blockers: Vec<Blocker>,
+    /// Extra properties extracted from the tracker (e.g. "platform", "severity").
+    #[serde(default)]
+    pub extra: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
