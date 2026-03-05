@@ -1,5 +1,7 @@
 pub mod mcp;
+pub mod mcp_http;
 pub mod notion;
+pub mod oauth;
 
 use crate::domain::issue::Issue;
 use crate::error::Result;

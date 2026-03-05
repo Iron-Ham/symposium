@@ -21,6 +21,7 @@ pub struct ServiceConfig {
 pub struct TrackerConfig {
     pub kind: String,
     pub mcp_command: String,
+    pub mcp_url: Option<String>,
     pub database_id: String,
     pub active_states: Vec<String>,
     pub terminal_states: Vec<String>,
@@ -36,6 +37,7 @@ impl Default for TrackerConfig {
         Self {
             kind: "notion".to_string(),
             mcp_command: "npx -y @notionhq/notion-mcp-server".to_string(),
+            mcp_url: None,
             database_id: String::new(),
             active_states: vec!["Todo".to_string(), "In Progress".to_string()],
             terminal_states: vec!["Done".to_string(), "Cancelled".to_string()],

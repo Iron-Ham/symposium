@@ -31,6 +31,9 @@ pub fn expand_vars(input: &str) -> String {
 /// Apply env expansion to key string fields in a ServiceConfig.
 pub fn expand_config(config: &mut ServiceConfig) {
     config.tracker.mcp_command = expand_vars(&config.tracker.mcp_command);
+    if let Some(ref s) = config.tracker.mcp_url {
+        config.tracker.mcp_url = Some(expand_vars(s));
+    }
     config.tracker.database_id = expand_vars(&config.tracker.database_id);
     config.workspace.root = expand_vars(&config.workspace.root);
     config.codex.command = expand_vars(&config.codex.command);
