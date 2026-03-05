@@ -1,0 +1,29 @@
+[package]
+name = "symposium"
+version = "0.1.0"
+edition = "2024"
+description = "Symphony spec orchestrator — polls Notion, dispatches coding agents"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+liquid = "0.26"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+notify = "7"
+notify-debouncer-mini = "0.5"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+regex = "1"
+askama = "0.12"
+tokio-util = { version = "0.7", features = ["time"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
