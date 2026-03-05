@@ -240,7 +240,7 @@ async fn run_worker(
 
     // Run multi-turn agent loop
     let success =
-        run_agent_attempt(&mut worker, &prompt_text, config.agent.max_turns, state, &issue.identifier).await?;
+        run_agent_attempt(&mut worker, &prompt_text, state, &issue.identifier).await?;
 
     if success {
         // Post-completion pipeline: commit → review → PR
@@ -278,7 +278,6 @@ async fn run_worker(
                 match run_agent_attempt(
                     &mut review_worker,
                     &review_prompt,
-                    config.agent.max_turns,
                     state,
                     &issue.identifier,
                 )
@@ -320,7 +319,7 @@ async fn run_worker(
                 status: "Opening draft PR".into(),
             }),
         );
-        let pr_title = format!("Bug {}: {}", issue.identifier, issue.title)
+        let pr_title = format!("[BUG-{}] {}", issue.identifier, issue.title)
             .replace('\'', "'\\''");
         let pr_body_text = format!(
             "Automated fix for bug **{}**: {}\n\n---\n*Opened by Symposium*",

@@ -47,7 +47,6 @@ pub enum StreamEvent {
 pub async fn run_agent_attempt(
     worker: &mut AgentWorker,
     _initial_prompt: &str,
-    _max_turns: u32,
     state: &crate::domain::state::OrchestratorState,
     issue_id: &str,
 ) -> Result<bool> {
@@ -86,50 +85,48 @@ pub async fn run_agent_attempt(
                 }
             }
             "assistant" => {
-                // Extract tool use or text from the message
                 if let Some(message) = msg.get("message")
                     && let Some(content) = message.get("content").and_then(|v| v.as_array())
                 {
-                        for block in content {
-                            let block_type =
-                                block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                            match block_type {
-                                "text" => {
-                                    if let Some(text) = block.get("text").and_then(|v| v.as_str())
-                                    {
-                                        let preview: String = text.chars().take(300).collect();
-                                        state.push_agent_event(
-                                            issue_id,
-                                            AgentEvent::now(AgentEventKind::Text {
-                                                text: preview,
-                                            }),
-                                        );
-                                    }
-                                }
-                                "tool_use" => {
-                                    let name = block
-                                        .get("name")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("unknown");
-                                    let input = block
-                                        .get("input")
-                                        .map(|v| v.to_string())
-                                        .unwrap_or_default();
-                                    let truncated: String = input.chars().take(200).collect();
+                    for block in content {
+                        let block_type =
+                            block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        match block_type {
+                            "text" => {
+                                if let Some(text) = block.get("text").and_then(|v| v.as_str())
+                                {
+                                    let preview: String = text.chars().take(300).collect();
                                     state.push_agent_event(
                                         issue_id,
-                                        AgentEvent::now(AgentEventKind::ToolCall {
-                                            name: name.to_string(),
-                                            arguments: truncated,
+                                        AgentEvent::now(AgentEventKind::Text {
+                                            text: preview,
                                         }),
                                     );
-                                    state.increment_turn(issue_id);
                                 }
-                                _ => {}
                             }
+                            "tool_use" => {
+                                let name = block
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let input = block
+                                    .get("input")
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_default();
+                                let truncated: String = input.chars().take(200).collect();
+                                state.push_agent_event(
+                                    issue_id,
+                                    AgentEvent::now(AgentEventKind::ToolCall {
+                                        name: name.to_string(),
+                                        arguments: truncated,
+                                    }),
+                                );
+                            }
+                            _ => {}
                         }
                     }
                 }
+            }
             "result" => {
                 let is_error = msg.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
                 let result_text = msg
