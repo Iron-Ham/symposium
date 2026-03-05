@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+const MAX_EVENTS: usize = 200;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveSession {
     pub issue_id: String,
@@ -10,6 +12,7 @@ pub struct LiveSession {
     pub started_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
     pub attempts: Vec<RunAttempt>,
+    pub events: Vec<AgentEvent>,
 }
 
 impl LiveSession {
@@ -23,6 +26,47 @@ impl LiveSession {
             started_at: now,
             last_activity: now,
             attempts: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    pub fn push_event(&mut self, event: AgentEvent) {
+        self.last_activity = Utc::now();
+        self.events.push(event);
+        if self.events.len() > MAX_EVENTS {
+            self.events.drain(..self.events.len() - MAX_EVENTS);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentEvent {
+    pub timestamp: DateTime<Utc>,
+    pub kind: AgentEventKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AgentEventKind {
+    #[serde(rename = "status")]
+    Status { status: String },
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "tool_call")]
+    ToolCall { name: String, arguments: String },
+    #[serde(rename = "tool_result")]
+    ToolResult { name: String, truncated: String },
+    #[serde(rename = "turn_complete")]
+    TurnComplete { turn: u32 },
+    #[serde(rename = "error")]
+    Error { message: String },
+}
+
+impl AgentEvent {
+    pub fn now(kind: AgentEventKind) -> Self {
+        Self {
+            timestamp: Utc::now(),
+            kind,
         }
     }
 }

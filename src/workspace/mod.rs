@@ -5,7 +5,7 @@ use crate::config::schema::ServiceConfig;
 use crate::domain::issue::Issue;
 use crate::error::{Error, Result};
 use crate::prompt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::watch;
 
 pub struct WorkspaceManager {
@@ -31,9 +31,20 @@ impl WorkspaceManager {
         Ok(dir)
     }
 
-    /// Render a hook script through Liquid with issue context.
-    fn render_hook(&self, hook: &str, issue: &Issue, attempt: Option<u32>) -> Result<String> {
-        prompt::build_prompt(hook, issue, attempt)
+    /// Render a hook script through Liquid with issue context and workspace path.
+    fn render_hook(
+        &self,
+        hook: &str,
+        issue: &Issue,
+        attempt: Option<u32>,
+        workspace: &Path,
+    ) -> Result<String> {
+        prompt::build_prompt_with_workspace(
+            hook,
+            issue,
+            attempt,
+            workspace.to_str(),
+        )
     }
 
     /// Ensure the workspace directory exists, run after_create hook if newly created.
@@ -42,15 +53,31 @@ impl WorkspaceManager {
         let newly_created = !dir.exists();
 
         if newly_created {
-            tokio::fs::create_dir_all(&dir).await.map_err(|e| {
-                Error::Workspace(format!("failed to create workspace {}: {e}", dir.display()))
-            })?;
-            tracing::info!(issue_key = issue.identifier, path = %dir.display(), "created workspace");
-
             let config = self.config_rx.borrow().clone();
             if let Some(hook) = &config.hooks.after_create {
-                let rendered = self.render_hook(hook, issue, None)?;
-                hooks::run_hook(&rendered, &dir, config.hooks.timeout()).await?;
+                // Ensure parent dir exists; the hook itself creates the workspace
+                // (e.g. git worktree add creates the target directory)
+                if let Some(parent) = dir.parent() {
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                        Error::Workspace(format!(
+                            "failed to create workspace parent {}: {e}",
+                            parent.display()
+                        ))
+                    })?;
+                }
+                tracing::info!(issue_key = issue.identifier, path = %dir.display(), "creating workspace");
+                let rendered = self.render_hook(hook, issue, None, &dir)?;
+                // Run hook from the parent directory since workspace doesn't exist yet
+                let cwd = dir.parent().unwrap_or(&dir);
+                hooks::run_hook(&rendered, cwd, config.hooks.timeout()).await?;
+            } else {
+                tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+                    Error::Workspace(format!(
+                        "failed to create workspace {}: {e}",
+                        dir.display()
+                    ))
+                })?;
+                tracing::info!(issue_key = issue.identifier, path = %dir.display(), "created workspace");
             }
         }
 
@@ -62,7 +89,7 @@ impl WorkspaceManager {
         let dir = self.workspace_dir(&issue.identifier)?;
         let config = self.config_rx.borrow().clone();
         if let Some(hook) = &config.hooks.before_run {
-            let rendered = self.render_hook(hook, issue, attempt)?;
+            let rendered = self.render_hook(hook, issue, attempt, &dir)?;
             hooks::run_hook(&rendered, &dir, config.hooks.timeout()).await?;
         }
         Ok(dir)
@@ -73,7 +100,7 @@ impl WorkspaceManager {
         let dir = self.workspace_dir(&issue.identifier)?;
         let config = self.config_rx.borrow().clone();
         if let Some(hook) = &config.hooks.after_run {
-            let rendered = self.render_hook(hook, issue, None)?;
+            let rendered = self.render_hook(hook, issue, None, &dir)?;
             let mut env = std::collections::HashMap::new();
             env.insert(
                 "RUN_SUCCESS".to_string(),

@@ -30,6 +30,9 @@ pub struct TrackerConfig {
     pub property_status: String,
     pub property_priority: String,
     pub property_description: String,
+    pub property_assignee: String,
+    /// Filter issues to only those assigned to this user ID.
+    pub assignee_user_id: Option<String>,
 }
 
 impl Default for TrackerConfig {
@@ -46,6 +49,8 @@ impl Default for TrackerConfig {
             property_status: "Status".to_string(),
             property_priority: "Priority".to_string(),
             property_description: "Description".to_string(),
+            property_assignee: "Assignee".to_string(),
+            assignee_user_id: None,
         }
     }
 }

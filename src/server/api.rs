@@ -19,6 +19,7 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(dashboard))
+        .route("/issue/{id}", get(issue_detail))
         .route("/api/v1/state", get(get_state))
         .route("/api/v1/issues/{id}", get(get_issue))
         .route("/api/v1/refresh", post(refresh))
@@ -29,6 +30,15 @@ pub fn router(state: AppState) -> Router {
 async fn dashboard(State(state): State<AppState>) -> axum::response::Html<String> {
     let snapshot = state.orchestrator.snapshot();
     let html = super::dashboard::render(&snapshot);
+    axum::response::Html(html)
+}
+
+async fn issue_detail(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> axum::response::Html<String> {
+    let snapshot = state.orchestrator.snapshot();
+    let html = super::dashboard::render_issue_detail(&snapshot, &id);
     axum::response::Html(html)
 }
 

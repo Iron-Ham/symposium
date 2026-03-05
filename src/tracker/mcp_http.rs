@@ -45,6 +45,17 @@ impl HttpMcpClient {
         self.send_notification("notifications/initialized", serde_json::json!({}))
             .await?;
 
+        // Discover available tools
+        if let Ok(tools_result) = self.send_request("tools/list", serde_json::json!({})).await
+            && let Some(tools) = tools_result.get("tools").and_then(|v| v.as_array())
+        {
+            let names: Vec<&str> = tools
+                .iter()
+                .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+                .collect();
+            tracing::info!(tools = ?names, "MCP server tools");
+        }
+
         Ok(())
     }
 

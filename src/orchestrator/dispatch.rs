@@ -12,6 +12,10 @@ pub fn is_eligible(issue: &Issue, state: &OrchestratorState, config: &ServiceCon
     if state.is_in_retry(&issue.identifier) {
         return false;
     }
+    // Not already completed successfully
+    if state.is_completed_successfully(&issue.identifier) {
+        return false;
+    }
     // Under concurrency limit
     if state.running_count() >= config.agent.max_concurrent_agents {
         return false;

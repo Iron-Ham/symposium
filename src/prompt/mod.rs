@@ -4,6 +4,16 @@ use liquid::ParserBuilder;
 
 /// Render the prompt template with issue data.
 pub fn build_prompt(template_str: &str, issue: &Issue, attempt: Option<u32>) -> Result<String> {
+    build_prompt_with_workspace(template_str, issue, attempt, None)
+}
+
+/// Render a template with issue data and an optional workspace path.
+pub fn build_prompt_with_workspace(
+    template_str: &str,
+    issue: &Issue,
+    attempt: Option<u32>,
+    workspace: Option<&str>,
+) -> Result<String> {
     let parser = ParserBuilder::with_stdlib()
         .build()
         .map_err(|e| Error::Prompt(format!("failed to build liquid parser: {e}")))?;
@@ -34,6 +44,13 @@ pub fn build_prompt(template_str: &str, issue: &Issue, attempt: Option<u32>) -> 
         globals.insert(
             "attempt".into(),
             liquid::model::Value::scalar(attempt as i64),
+        );
+    }
+
+    if let Some(ws) = workspace {
+        globals.insert(
+            "workspace".into(),
+            liquid::model::Value::scalar(ws.to_string()),
         );
     }
 

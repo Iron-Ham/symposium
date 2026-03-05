@@ -78,6 +78,15 @@ impl OrchestratorState {
         self.inner.lock().unwrap().retries.contains_key(issue_id)
     }
 
+    pub fn is_completed_successfully(&self, issue_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .completed
+            .iter()
+            .any(|e| e.issue_id == issue_id && e.success)
+    }
+
     pub fn running_count(&self) -> usize {
         self.inner.lock().unwrap().running.len()
     }
@@ -140,9 +149,33 @@ impl OrchestratorState {
             .collect()
     }
 
-    pub fn record_agent_event(&self, issue_id: &str, _event: serde_json::Value) {
+    pub fn push_agent_event(
+        &self,
+        issue_id: &str,
+        event: super::session::AgentEvent,
+    ) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(entry) = inner.running.get_mut(issue_id) {
+            entry.session.push_event(event);
+        }
+    }
+
+    pub fn update_session_status(
+        &self,
+        issue_id: &str,
+        status: super::session::RunStatus,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(entry) = inner.running.get_mut(issue_id) {
+            entry.session.status = status;
+            entry.session.last_activity = Utc::now();
+        }
+    }
+
+    pub fn increment_turn(&self, issue_id: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(entry) = inner.running.get_mut(issue_id) {
+            entry.session.current_turn += 1;
             entry.session.last_activity = Utc::now();
         }
     }

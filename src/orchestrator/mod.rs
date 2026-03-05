@@ -98,7 +98,8 @@ impl Orchestrator {
             }
             OrchestratorEvent::AgentUpdate { issue_id, event } => {
                 tracing::debug!(issue_id, "agent update");
-                self.state.record_agent_event(&issue_id, event);
+                // Events are now pushed directly from workers via state.push_agent_event
+                let _ = (issue_id, event);
             }
             OrchestratorEvent::ConfigReloaded => {
                 tracing::info!("config reloaded event");
