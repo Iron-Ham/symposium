@@ -98,3 +98,21 @@ This is a bug fix. Focus on:
 This is retry attempt {{ attempt }}. Review what happened in the previous attempt and continue from where you left off.
 {% endif %}
 ```
+
+## PR Metadata
+
+Symposium automatically instructs agents to write PR metadata files in the workspace root:
+
+- **`PR_TITLE`** — A single line with the PR title. Should be a concise, human-readable
+  summary of the actual change (not just the bug title). No conventional commit prefixes.
+- **`PR_BODY.md`** — Markdown PR body including investigation reasoning, what was changed
+  and why, and a link back to the issue (e.g. `Fixes 316205`).
+
+The **implementer agent** writes these files after committing its fix, since it has the
+full context of what it investigated and why it chose its approach. The **review agent**
+then updates them if it made any additional changes.
+
+If the files are missing, Symposium falls back to a generic title/body based on the
+issue ID and title.
+
+These files are **not** committed to git — they are read from disk and then cleaned up.

@@ -225,8 +225,11 @@ async fn run_worker(
     // Run before_run hook
     ws.prepare(issue, attempt).await?;
 
-    // Build prompt from template
-    let prompt_text = prompt::build_prompt(&config.prompt_template, issue, attempt)?;
+    // Build prompt from template, with PR metadata instructions appended.
+    // The implementer has the best context for writing the initial PR description
+    // since it performed the investigation and chose the fix.
+    let mut prompt_text = prompt::build_prompt(&config.prompt_template, issue, attempt)?;
+    prompt_text.push_str(&pr_metadata_instructions(issue));
 
     // Start agent session
     state.push_agent_event(
@@ -263,7 +266,10 @@ async fn run_worker(
                 status: "Running deep review".into(),
             }),
         );
-        let review_prompt = build_review_prompt(issue);
+        let mut review_prompt = build_review_prompt(issue);
+        // Ask the reviewer to update the PR metadata the implementer wrote,
+        // accounting for any changes the review introduced.
+        review_prompt.push_str(&pr_metadata_update_instructions());
         match runner
             .start_session(&agent_dir, &review_prompt, &issue.identifier)
             .await
@@ -301,11 +307,11 @@ async fn run_worker(
                 status: "Opening draft PR".into(),
             }),
         );
-        let pr_title = format!("[BUG-{}] {}", issue.identifier, issue.title);
-        let pr_body_text = format!(
-            "Automated fix for bug **{}**: {}\n\n---\n*Opened by Symposium*",
-            issue.identifier, issue.title,
-        );
+
+        // Read agent-generated PR metadata, falling back to defaults
+        let (pr_title, pr_body_text) =
+            read_pr_metadata(&workspace_dir, issue).await;
+
         // Write title/body to temp files outside the workspace to avoid accidental git add
         let tmp = std::env::temp_dir();
         let title_file = tmp.join(format!("symposium-pr-title-{}", issue.identifier));
@@ -348,6 +354,47 @@ async fn run_worker(
     Ok(success)
 }
 
+/// Read agent-generated PR metadata from the workspace, falling back to defaults.
+///
+/// The agent is instructed to write `PR_TITLE` and `PR_BODY.md` in the workspace root.
+/// These files contain the PR title (a single line) and the full PR body (markdown)
+/// respectively. If either file is missing, we fall back to a generic default.
+async fn read_pr_metadata(workspace_dir: &std::path::Path, issue: &Issue) -> (String, String) {
+    let title_path = workspace_dir.join("PR_TITLE");
+    let body_path = workspace_dir.join("PR_BODY.md");
+
+    let pr_title = match tokio::fs::read_to_string(&title_path).await {
+        Ok(contents) => {
+            let _ = tokio::fs::remove_file(&title_path).await;
+            let title = contents.trim().to_string();
+            if title.is_empty() { default_pr_title(issue) } else { title }
+        }
+        Err(_) => default_pr_title(issue),
+    };
+
+    let pr_body = match tokio::fs::read_to_string(&body_path).await {
+        Ok(contents) => {
+            let _ = tokio::fs::remove_file(&body_path).await;
+            let body = contents.trim().to_string();
+            if body.is_empty() { default_pr_body(issue) } else { body }
+        }
+        Err(_) => default_pr_body(issue),
+    };
+
+    (pr_title, pr_body)
+}
+
+fn default_pr_title(issue: &Issue) -> String {
+    format!("[{}] {}", issue.identifier, issue.title)
+}
+
+fn default_pr_body(issue: &Issue) -> String {
+    format!(
+        "Automated fix for **{}**: {}\n\n---\n*Opened by Symposium*",
+        issue.identifier, issue.title,
+    )
+}
+
 /// Build a review-focused prompt for the second agent pass.
 fn build_review_prompt(issue: &Issue) -> String {
     format!(
@@ -373,6 +420,40 @@ If you made any changes, commit them with `git add` and `git commit` with a desc
         id = issue.identifier,
         title = issue.title,
     )
+}
+
+/// Instructions appended to the implementer prompt for writing PR metadata files.
+///
+/// The implementer has the richest context — it investigated the bug, found
+/// the root cause, and chose the fix — so it writes the initial PR description.
+fn pr_metadata_instructions(issue: &Issue) -> String {
+    format!(
+        r#"
+
+After committing, write a PR title and body for the changes on this branch:
+
+1. Write a single-line PR title to a file called `PR_TITLE` in the root of the git repository. The title should be a concise, human-readable summary of the actual change (not just the bug title). Do NOT include prefixes like `fix:` or `[BUG-123]`.
+2. Write a PR body in Markdown to a file called `PR_BODY.md` in the root of the git repository. The body should include:
+   - **Summary**: 1-2 sentence overview of the change
+   - **Investigation**: What you found when investigating the root cause
+   - **Fix**: What was changed and why this approach was chosen
+   - **Testing**: How the fix was verified
+   - A link back to the issue: `Fixes {id}`
+
+These files must NOT be git-committed — just write them to disk."#,
+        id = issue.identifier,
+    )
+}
+
+/// Instructions appended to the review prompt for updating PR metadata.
+///
+/// The reviewer may have made additional changes, so it updates the existing
+/// PR metadata the implementer wrote to reflect the final state of the branch.
+fn pr_metadata_update_instructions() -> String {
+    r#"
+
+Finally, read the `PR_TITLE` and `PR_BODY.md` files in the root of the git repository. These were written by the implementer. If you made any changes during your review, update these files to reflect the final state of the branch. If you made no changes, leave them as-is. Do NOT git-commit these files."#
+        .to_string()
 }
 
 
