@@ -90,4 +90,28 @@ You are working on issue {{ issue.identifier }}.
         let result = parse_workflow("---\ntracker:\n  kind: notion\n");
         assert!(result.is_err());
     }
+
+    #[test]
+    fn parse_review_config() {
+        let content = r#"---
+review:
+  enabled: false
+  prompt_template: "Review {{ issue.identifier }} carefully."
+  before_review: "npx my-linter"
+---
+Prompt here."#;
+        let (config, _) = parse_workflow(content).unwrap();
+        assert!(!config.review.enabled);
+        assert_eq!(config.review.prompt_template, "Review {{ issue.identifier }} carefully.");
+        assert_eq!(config.review.before_review.as_deref(), Some("npx my-linter"));
+    }
+
+    #[test]
+    fn parse_review_config_defaults() {
+        let content = "---\n---\nPrompt here.";
+        let (config, _) = parse_workflow(content).unwrap();
+        assert!(config.review.enabled);
+        assert!(config.review.prompt_template.is_empty());
+        assert!(config.review.before_review.is_none());
+    }
 }

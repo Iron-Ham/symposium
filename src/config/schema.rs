@@ -12,6 +12,7 @@ pub struct ServiceConfig {
     pub agent: AgentConfig,
     pub codex: CodexConfig,
     pub server: ServerConfig,
+    pub review: ReviewConfig,
     pub prompt_template: String,
 }
 
@@ -170,5 +171,27 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self { port: 8080 }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ReviewConfig {
+    /// Whether to run the review step at all. Defaults to true.
+    pub enabled: bool,
+    /// Liquid template for the review prompt. If empty, uses the built-in default.
+    pub prompt_template: String,
+    /// Optional shell hook to run before the review agent starts
+    /// (e.g. to generate a lint/review report the agent can read).
+    pub before_review: Option<String>,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            prompt_template: String::new(),
+            before_review: None,
+        }
     }
 }
