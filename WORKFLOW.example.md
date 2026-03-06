@@ -61,6 +61,21 @@ codex:
 
 server:
   port: 8080
+
+# Optional: configure the post-completion review step
+review:
+  # Set to false to skip the review step entirely (default: true)
+  # enabled: false
+  # Custom Liquid template for the review prompt (uses built-in default if empty).
+  # Same variables as the main prompt template: {{ issue.identifier }}, {{ issue.title }}, etc.
+  # prompt_template: |
+  #   Review changes for {{ issue.identifier }}: {{ issue.title }}.
+  #   Run `/deep-review --changes` and fix any issues found.
+  #   Commit fixes with `git add` and `git commit`.
+  # Optional: shell hook to run before the review agent starts
+  # (e.g. generate a lint report the agent can read)
+  # before_review: |
+  #   cd {{ workspace }} && npx eslint --format json -o review-report.json src/
 ---
 ```
 

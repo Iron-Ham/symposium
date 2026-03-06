@@ -259,44 +259,66 @@ async fn run_worker(
         // Post-completion pipeline: commit → review → PR
         let hook_timeout = config.hooks.timeout();
 
-        // 1. Run review agent
-        state.push_agent_event(
-            &issue.identifier,
-            AgentEvent::now(AgentEventKind::Status {
-                status: "Running deep review".into(),
-            }),
-        );
-        let mut review_prompt = build_review_prompt(issue);
-        // Ask the reviewer to update the PR metadata the implementer wrote,
-        // accounting for any changes the review introduced.
-        review_prompt.push_str(&pr_metadata_update_instructions());
-        match runner
-            .start_session(&agent_dir, &review_prompt, &issue.identifier)
-            .await
-        {
-            Ok(mut review_worker) => {
-                match run_agent_attempt(
-                    &mut review_worker,
-                    &review_prompt,
-                    state,
-                    &issue.identifier,
+        // 1. Run review agent (if enabled)
+        if config.review.enabled {
+            state.push_agent_event(
+                &issue.identifier,
+                AgentEvent::now(AgentEventKind::Status {
+                    status: "Running deep review".into(),
+                }),
+            );
+
+            // Run before_review hook if configured
+            if let Some(ref hook_script) = config.review.before_review {
+                let rendered = prompt::build_prompt_with_workspace(
+                    hook_script,
+                    issue,
+                    attempt,
+                    Some(&workspace_dir.to_string_lossy()),
                 )
-                .await
+                .unwrap_or_else(|_| hook_script.clone());
+                if let Err(e) =
+                    hooks::run_hook(&rendered, &workspace_dir, hook_timeout).await
                 {
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            issue_id = issue.identifier,
-                            "review agent failed: {e}"
-                        );
-                    }
+                    tracing::warn!(
+                        issue_id = issue.identifier,
+                        "before_review hook failed: {e}"
+                    );
                 }
             }
-            Err(e) => {
-                tracing::warn!(
-                    issue_id = issue.identifier,
-                    "failed to start review agent: {e}"
-                );
+
+            let mut review_prompt = build_review_prompt(issue, &config.review.prompt_template);
+            // Ask the reviewer to update the PR metadata the implementer wrote,
+            // accounting for any changes the review introduced.
+            review_prompt.push_str(&pr_metadata_update_instructions());
+            match runner
+                .start_session(&agent_dir, &review_prompt, &issue.identifier)
+                .await
+            {
+                Ok(mut review_worker) => {
+                    match run_agent_attempt(
+                        &mut review_worker,
+                        &review_prompt,
+                        state,
+                        &issue.identifier,
+                    )
+                    .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                issue_id = issue.identifier,
+                                "review agent failed: {e}"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        issue_id = issue.identifier,
+                        "failed to start review agent: {e}"
+                    );
+                }
             }
         }
 
@@ -396,7 +418,22 @@ fn default_pr_body(issue: &Issue) -> String {
 }
 
 /// Build a review-focused prompt for the second agent pass.
-fn build_review_prompt(issue: &Issue) -> String {
+///
+/// If the user provides a custom `review.prompt_template` in their workflow config,
+/// it is rendered as a Liquid template with issue variables. Otherwise, the built-in
+/// default review prompt is used.
+fn build_review_prompt(issue: &Issue, custom_template: &str) -> String {
+    if !custom_template.is_empty() {
+        return prompt::build_prompt(custom_template, issue, None)
+            .unwrap_or_else(|e| {
+                tracing::warn!("failed to render custom review template: {e}, using default");
+                build_default_review_prompt(issue)
+            });
+    }
+    build_default_review_prompt(issue)
+}
+
+fn build_default_review_prompt(issue: &Issue) -> String {
     format!(
         r#"You are reviewing changes for bug {id}: {title}.
 
