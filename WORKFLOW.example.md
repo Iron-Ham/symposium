@@ -43,7 +43,7 @@ hooks:
   # Runs once when a new workspace is created for an issue.
   # Use git worktree for fast, lightweight checkouts from a local repo:
   after_create: |
-    git -C ~/Developer/my-org/my-repo worktree add {{ workspace }} -b symposium/bug-{{ issue.identifier }}
+    git -C ~/Developer/my-org/my-repo worktree add {{ workspace }} -b symposium/bug-{{ issue.safe_identifier }}
   # Optional: runs before each agent attempt (retries included)
   # before_run: |
   #   git fetch origin main && git rebase origin/main
@@ -61,6 +61,31 @@ codex:
 
 server:
   port: 8080
+
+# Optional: inject supplementary MCP servers into agent sessions.
+# These are passed to the claude CLI via --mcp-config.
+# Useful for giving agents access to Sentry, Datadog, PagerDuty, etc.
+# mcp_servers:
+#   sentry:
+#     type: http
+#     url: "https://mcp.sentry.dev/mcp"
+#   custom-linter:
+#     type: stdio
+#     command: "npx"
+#     args: ["-y", "@my-org/linter-mcp"]
+#     env:
+#       API_KEY: "$MY_API_KEY"  # env vars are expanded
+
+# Optional: poll Sentry for crashes alongside Notion issues.
+# Both sources are merged into a single dispatch queue each tick.
+# Sentry issue IDs are prefixed with "sentry:" to avoid collisions.
+# sentry:
+#   enabled: true
+#   org: "my-org"
+#   project: "my-project"
+#   mcp_url: "https://mcp.sentry.dev/mcp"  # Sentry MCP server (OAuth auth)
+#   query: "release:[my-app@1.7.*,my-app@1.8.*]"  # Sentry search syntax
+#   min_events: 5                           # skip issues below this threshold
 
 # Optional: configure the post-completion review step
 review:
@@ -85,7 +110,8 @@ Everything after the YAML front matter closing `---` is a Liquid template.
 It is rendered per-issue and sent to the agent as its initial prompt via stdin.
 
 Available variables:
-- `{{ issue.identifier }}` — issue ID (e.g. "316205")
+- `{{ issue.identifier }}` — issue ID (e.g. "316205" or "sentry:MAIL-IOS-3B")
+- `{{ issue.safe_identifier }}` — branch-safe version of the ID (colons → hyphens)
 - `{{ issue.title }}` — issue title
 - `{{ issue.description }}` — issue description/notes
 - `{{ issue.status }}` — current status

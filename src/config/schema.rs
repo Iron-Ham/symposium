@@ -1,4 +1,5 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -13,9 +14,66 @@ pub struct ServiceConfig {
     pub codex: CodexConfig,
     pub server: ServerConfig,
     pub review: ReviewConfig,
+    pub mcp_servers: HashMap<String, McpServerConfig>,
+    pub sentry: SentryConfig,
     pub prompt_template: String,
 }
 
+fn default_sentry_mcp_url() -> String {
+    "https://mcp.sentry.dev/mcp".to_string()
+}
+
+fn default_sentry_min_events() -> u64 {
+    5
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SentryConfig {
+    pub enabled: bool,
+    pub org: String,
+    pub project: String,
+    /// MCP server URL for Sentry (uses OAuth for auth).
+    #[serde(default = "default_sentry_mcp_url")]
+    pub mcp_url: String,
+    /// Raw Sentry search query appended after `is:unresolved project:<project>`.
+    /// Use Sentry search syntax directly, e.g.:
+    /// `"release:[so.notion.Mail@1.7.*,so.notion.Mail@1.8.*]"`
+    pub query: String,
+    #[serde(default = "default_sentry_min_events")]
+    pub min_events: u64,
+}
+
+impl Default for SentryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            org: String::new(),
+            project: String::new(),
+            mcp_url: default_sentry_mcp_url(),
+            query: String::new(),
+            min_events: default_sentry_min_events(),
+        }
+    }
+}
+
+fn default_mcp_type() -> String {
+    "stdio".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct McpServerConfig {
+    #[serde(rename = "type", default = "default_mcp_type")]
+    pub server_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]

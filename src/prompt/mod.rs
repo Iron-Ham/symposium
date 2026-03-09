@@ -22,8 +22,12 @@ pub fn build_prompt_with_workspace(
         .parse(template_str)
         .map_err(|e| Error::Prompt(format!("failed to parse template: {e}")))?;
 
+    // Provide a branch-safe version of the identifier (colons → hyphens, etc.)
+    let safe_id = crate::workspace::safety::sanitize_key(&issue.identifier);
+
     let mut issue_obj = liquid::object!({
         "identifier": issue.identifier,
+        "safe_identifier": safe_id,
         "title": issue.title,
         "description": issue.description.as_deref().unwrap_or(""),
         "status": issue.status,
@@ -75,6 +79,7 @@ mod tests {
             url: Some("https://notion.so/page".to_string()),
             notion_page_id: Some("abc123".to_string()),
             blockers: vec![],
+            source: "notion".to_string(),
             extra: HashMap::new(),
         };
 
@@ -94,6 +99,7 @@ mod tests {
             url: None,
             notion_page_id: None,
             blockers: vec![],
+            source: "notion".to_string(),
             extra: HashMap::new(),
         };
 
@@ -116,6 +122,7 @@ mod tests {
             url: None,
             notion_page_id: None,
             blockers: vec![],
+            source: "notion".to_string(),
             extra,
         };
 
