@@ -62,6 +62,20 @@ codex:
 server:
   port: 8080
 
+# Optional: inject supplementary MCP servers into agent sessions.
+# These are passed to the claude CLI via --mcp-config.
+# Useful for giving agents access to Sentry, Datadog, PagerDuty, etc.
+# mcp_servers:
+#   sentry:
+#     type: http
+#     url: "https://mcp.sentry.dev/mcp"
+#   custom-linter:
+#     type: stdio
+#     command: "npx"
+#     args: ["-y", "@my-org/linter-mcp"]
+#     env:
+#       API_KEY: "$MY_API_KEY"  # env vars are expanded
+
 # Optional: configure the post-completion review step
 review:
   # Set to false to skip the review step entirely (default: true)

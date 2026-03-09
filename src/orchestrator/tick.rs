@@ -247,7 +247,7 @@ async fn run_worker(
     };
 
     let runner = agent::AgentRunner::new(config.clone());
-    let mut worker = runner
+    let (mut worker, _mcp_guard) = runner
         .start_session(&agent_dir, &prompt_text, &issue.identifier)
         .await?;
 
@@ -295,7 +295,7 @@ async fn run_worker(
                 .start_session(&agent_dir, &review_prompt, &issue.identifier)
                 .await
             {
-                Ok(mut review_worker) => {
+                Ok((mut review_worker, _review_mcp_guard)) => {
                     match run_agent_attempt(
                         &mut review_worker,
                         &review_prompt,

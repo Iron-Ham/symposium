@@ -114,4 +114,53 @@ Prompt here."#;
         assert!(config.review.prompt_template.is_empty());
         assert!(config.review.before_review.is_none());
     }
+
+    #[test]
+    fn parse_mcp_server_http() {
+        let content = r#"---
+mcp_servers:
+  sentry:
+    type: http
+    url: "https://mcp.sentry.dev/mcp"
+---
+Prompt here."#;
+        let (config, _) = parse_workflow(content).unwrap();
+        assert_eq!(config.mcp_servers.len(), 1);
+        let sentry = &config.mcp_servers["sentry"];
+        assert_eq!(sentry.server_type, "http");
+        assert_eq!(sentry.url.as_deref(), Some("https://mcp.sentry.dev/mcp"));
+    }
+
+    #[test]
+    fn parse_mcp_server_stdio_with_args_and_env() {
+        let content = r#"---
+mcp_servers:
+  custom-linter:
+    type: stdio
+    command: "npx"
+    args: ["-y", "@my-org/linter-mcp"]
+    env:
+      API_KEY: "test-key"
+---
+Prompt here."#;
+        let (config, _) = parse_workflow(content).unwrap();
+        let linter = &config.mcp_servers["custom-linter"];
+        assert_eq!(linter.server_type, "stdio");
+        assert_eq!(linter.command.as_deref(), Some("npx"));
+        assert_eq!(
+            linter.args.as_deref(),
+            Some(["-y".to_string(), "@my-org/linter-mcp".to_string()].as_slice())
+        );
+        assert_eq!(
+            linter.env.as_ref().unwrap().get("API_KEY").unwrap(),
+            "test-key"
+        );
+    }
+
+    #[test]
+    fn parse_mcp_servers_empty_by_default() {
+        let content = "---\n---\nPrompt here.";
+        let (config, _) = parse_workflow(content).unwrap();
+        assert!(config.mcp_servers.is_empty());
+    }
 }

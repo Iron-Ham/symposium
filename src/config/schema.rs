@@ -1,4 +1,5 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -13,9 +14,27 @@ pub struct ServiceConfig {
     pub codex: CodexConfig,
     pub server: ServerConfig,
     pub review: ReviewConfig,
+    pub mcp_servers: HashMap<String, McpServerConfig>,
     pub prompt_template: String,
 }
 
+fn default_mcp_type() -> String {
+    "stdio".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct McpServerConfig {
+    #[serde(rename = "type", default = "default_mcp_type")]
+    pub server_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
