@@ -4,7 +4,7 @@ pub mod notion;
 pub mod oauth;
 pub mod sentry;
 
-use crate::domain::issue::Issue;
+use crate::domain::issue::{Comment, Issue};
 use crate::error::Result;
 
 /// Trait for issue tracker backends.
@@ -21,4 +21,9 @@ pub trait TrackerClient {
 
     /// Execute an arbitrary query on behalf of an agent.
     async fn agent_query(&mut self, sql: &str) -> Result<serde_json::Value>;
+
+    /// Fetch comments on an issue page. Returns empty vec by default.
+    async fn fetch_comments(&mut self, _page_id: &str) -> Result<Vec<Comment>> {
+        Ok(vec![])
+    }
 }

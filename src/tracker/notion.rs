@@ -2,7 +2,7 @@ use super::mcp::McpClient;
 use super::mcp_http::HttpMcpClient;
 use super::TrackerClient;
 use crate::config::schema::TrackerConfig;
-use crate::domain::issue::Issue;
+use crate::domain::issue::{Comment, Issue};
 use crate::error::{Error, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -156,6 +156,7 @@ impl NotionTracker {
             blockers: vec![],
             source: "notion".to_string(),
             extra,
+            comments: vec![],
         })
     }
 
@@ -236,6 +237,96 @@ impl NotionTracker {
     }
 }
 
+impl NotionTracker {
+    /// Extract the raw text from an MCP tool response content block.
+    fn extract_text(result: &Value) -> Option<String> {
+        // MCP returns {"content": [{"type":"text","text":"..."}]}
+        // or the tool result may already have a "text" field at the top level.
+        if let Some(text) = result.get("text").and_then(|v| v.as_str()) {
+            return Some(text.to_string());
+        }
+        let content = result.get("content").and_then(|v| v.as_array())?;
+        for block in content {
+            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                return Some(text.to_string());
+            }
+        }
+        None
+    }
+
+    /// Parse comments from the Notion MCP `notion-get-comments` XML response.
+    ///
+    /// The response is XML with structure:
+    /// ```xml
+    /// <discussions>
+    ///   <discussion ...>
+    ///     <comment user-url="user://uuid" datetime="...">body text</comment>
+    ///     ...
+    ///   </discussion>
+    /// </discussions>
+    /// ```
+    fn parse_comments(result: &Value) -> Vec<Comment> {
+        let Some(xml) = Self::extract_text(result) else {
+            tracing::debug!("no text content in comments response");
+            return vec![];
+        };
+        Self::parse_comments_xml(&xml)
+    }
+
+    fn parse_comments_xml(xml: &str) -> Vec<Comment> {
+        use regex::Regex;
+
+        // Match <comment ...>...</comment> elements. The body can contain
+        // inline XML tags like <mention-user/>, <br/>, <mention-date/>.
+        let comment_re = Regex::new(
+            r#"<comment\b([^>]*)>([\s\S]*?)</comment>"#
+        ).expect("valid regex");
+
+        let datetime_re = Regex::new(
+            r#"datetime="([^"]*)""#
+        ).expect("valid regex");
+
+        let user_url_re = Regex::new(
+            r#"user-url="user://([^"]*)""#
+        ).expect("valid regex");
+
+        // Strip inline XML tags to get plain text body
+        let tag_re = Regex::new(r"<[^>]+/?>").expect("valid regex");
+
+        let mut comments = Vec::new();
+
+        for cap in comment_re.captures_iter(xml) {
+            let attrs = &cap[1];
+            let raw_body = &cap[2];
+
+            // Extract datetime
+            let created_at = datetime_re
+                .captures(attrs)
+                .map(|c| c[1].to_string());
+
+            // Extract user URL as author identifier (we don't have names, only UUIDs)
+            let author = user_url_re
+                .captures(attrs)
+                .map(|c| c[1].to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+
+            // Clean body: strip XML tags, normalize <br/> to newlines
+            let body = raw_body.replace("<br/>", "\n");
+            let body = tag_re.replace_all(&body, "").trim().to_string();
+
+            if !body.is_empty() {
+                comments.push(Comment {
+                    author,
+                    body,
+                    created_at,
+                });
+            }
+        }
+
+        comments
+    }
+}
+
 impl TrackerClient for NotionTracker {
     async fn fetch_candidate_issues(&mut self) -> Result<Vec<Issue>> {
         let ds_url = self.data_source_url();
@@ -307,5 +398,112 @@ impl TrackerClient for NotionTracker {
                 }),
             )
             .await
+    }
+
+    async fn fetch_comments(&mut self, page_id: &str) -> Result<Vec<Comment>> {
+        let result = self
+            .client
+            .call_tool(
+                "notion-get-comments",
+                serde_json::json!({ "page_id": page_id }),
+            )
+            .await?;
+        let comments = Self::parse_comments(&result);
+        tracing::debug!(page_id, count = comments.len(), "fetched comments");
+        Ok(comments)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_comments_xml_basic() {
+        let xml = r#"<discussions total-count="1" shown-count="1">
+<discussion id="disc-1" comment-count="2" resolved="false" type="comment" context="page">
+<comment id="c1" user-url="user://alice-uuid" datetime="2026-03-01T10:00:00.000Z">This happens on login</comment>
+<comment id="c2" user-url="user://bob-uuid" datetime="2026-03-02T14:30:00.000Z">Confirmed on staging</comment>
+</discussion>
+</discussions>"#;
+
+        let comments = NotionTracker::parse_comments_xml(xml);
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].author, "alice-uuid");
+        assert_eq!(comments[0].body, "This happens on login");
+        assert_eq!(
+            comments[0].created_at.as_deref(),
+            Some("2026-03-01T10:00:00.000Z")
+        );
+        assert_eq!(comments[1].author, "bob-uuid");
+        assert_eq!(comments[1].body, "Confirmed on staging");
+    }
+
+    #[test]
+    fn parse_comments_from_mcp_content_wrapper() {
+        let xml = r#"<discussions><discussion><comment id="c1" user-url="user://carol-uuid" datetime="2026-03-03T09:00:00.000Z">Fix the auth check</comment></discussion></discussions>"#;
+        let data = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": xml
+            }]
+        });
+
+        let comments = NotionTracker::parse_comments(&data);
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].author, "carol-uuid");
+        assert_eq!(comments[0].body, "Fix the auth check");
+    }
+
+    #[test]
+    fn parse_comments_strips_inline_tags() {
+        let xml = r#"<discussions><discussion>
+<comment id="c1" user-url="user://uuid1" datetime="2026-01-05T19:25:00.000Z"><mention-user url="user://other"/> you should fix this<br/>See the logs</comment>
+</discussion></discussions>"#;
+
+        let comments = NotionTracker::parse_comments_xml(xml);
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "you should fix this\nSee the logs");
+    }
+
+    #[test]
+    fn parse_comments_skips_empty_body() {
+        let xml = r#"<discussions><discussion>
+<comment id="c1" user-url="user://uuid1" datetime="2026-01-01T00:00:00Z"><mention-user url="user://x"/></comment>
+<comment id="c2" user-url="user://uuid2" datetime="2026-01-02T00:00:00Z">Real comment</comment>
+</discussion></discussions>"#;
+
+        let comments = NotionTracker::parse_comments_xml(xml);
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "Real comment");
+    }
+
+    #[test]
+    fn parse_comments_missing_user_url_defaults() {
+        let xml = r#"<discussions><discussion>
+<comment id="c1" datetime="2026-01-01T00:00:00Z">Anonymous comment</comment>
+</discussion></discussions>"#;
+
+        let comments = NotionTracker::parse_comments_xml(xml);
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].author, "Unknown");
+    }
+
+    #[test]
+    fn parse_comments_empty_discussions() {
+        let xml = r#"<discussions total-count="0" shown-count="0"></discussions>"#;
+
+        let comments = NotionTracker::parse_comments_xml(xml);
+        assert!(comments.is_empty());
+    }
+
+    #[test]
+    fn parse_comments_from_text_field() {
+        let xml = r#"<discussions><discussion><comment id="c1" user-url="user://uuid1" datetime="2026-01-01T00:00:00Z">Direct text</comment></discussion></discussions>"#;
+        let data = serde_json::json!({ "text": xml });
+
+        let comments = NotionTracker::parse_comments(&data);
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].body, "Direct text");
     }
 }

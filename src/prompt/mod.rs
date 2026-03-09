@@ -25,6 +25,25 @@ pub fn build_prompt_with_workspace(
     // Provide a branch-safe version of the identifier (colons → hyphens, etc.)
     let safe_id = crate::workspace::safety::sanitize_key(&issue.identifier);
 
+    // Format comments into a readable string for template access
+    let comments_text = if issue.comments.is_empty() {
+        String::new()
+    } else {
+        issue
+            .comments
+            .iter()
+            .map(|c| {
+                let ts = c
+                    .created_at
+                    .as_deref()
+                    .map(|t| format!(" ({t})"))
+                    .unwrap_or_default();
+                format!("**{}**{}: {}", c.author, ts, c.body)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+
     let mut issue_obj = liquid::object!({
         "identifier": issue.identifier,
         "safe_identifier": safe_id,
@@ -33,6 +52,7 @@ pub fn build_prompt_with_workspace(
         "status": issue.status,
         "priority": issue.priority.as_deref().unwrap_or(""),
         "url": issue.url.as_deref().unwrap_or(""),
+        "comments": comments_text,
     });
 
     // Merge extra properties so templates can use e.g. {{ issue.platform }}
@@ -81,6 +101,7 @@ mod tests {
             blockers: vec![],
             source: "notion".to_string(),
             extra: HashMap::new(),
+            comments: vec![],
         };
 
         let template = "Work on {{ issue.identifier }}: {{ issue.title }}\n{{ issue.description }}";
@@ -101,6 +122,7 @@ mod tests {
             blockers: vec![],
             source: "notion".to_string(),
             extra: HashMap::new(),
+            comments: vec![],
         };
 
         let template = "{% if attempt %}Retry #{{ attempt }}{% endif %} {{ issue.identifier }}";
@@ -124,10 +146,67 @@ mod tests {
             blockers: vec![],
             source: "notion".to_string(),
             extra,
+            comments: vec![],
         };
 
         let template = "Platform: {{ issue.platform }}";
         let result = build_prompt(template, &issue, None).unwrap();
         assert_eq!(result, "Platform: iOS");
+    }
+
+    #[test]
+    fn test_comments_render() {
+        use crate::domain::issue::Comment;
+
+        let issue = Issue {
+            identifier: "TASK-789".to_string(),
+            title: "Auth bug".to_string(),
+            description: None,
+            status: "Todo".to_string(),
+            priority: None,
+            url: None,
+            notion_page_id: None,
+            blockers: vec![],
+            source: "notion".to_string(),
+            extra: HashMap::new(),
+            comments: vec![
+                Comment {
+                    author: "Alice".to_string(),
+                    body: "This happens on login".to_string(),
+                    created_at: Some("2026-03-01T10:00:00Z".to_string()),
+                },
+                Comment {
+                    author: "Bob".to_string(),
+                    body: "Confirmed on staging".to_string(),
+                    created_at: None,
+                },
+            ],
+        };
+
+        let template = "{% if issue.comments != blank %}Comments:\n{{ issue.comments }}{% endif %}";
+        let result = build_prompt(template, &issue, None).unwrap();
+        assert!(result.contains("**Alice** (2026-03-01T10:00:00Z): This happens on login"));
+        assert!(result.contains("**Bob**: Confirmed on staging"));
+    }
+
+    #[test]
+    fn test_empty_comments_render() {
+        let issue = Issue {
+            identifier: "TASK-000".to_string(),
+            title: "No comments".to_string(),
+            description: None,
+            status: "Todo".to_string(),
+            priority: None,
+            url: None,
+            notion_page_id: None,
+            blockers: vec![],
+            source: "notion".to_string(),
+            extra: HashMap::new(),
+            comments: vec![],
+        };
+
+        let template = "{% if issue.comments != blank %}Comments:\n{{ issue.comments }}{% else %}No comments{% endif %}";
+        let result = build_prompt(template, &issue, None).unwrap();
+        assert_eq!(result, "No comments");
     }
 }
