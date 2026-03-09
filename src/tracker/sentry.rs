@@ -196,6 +196,7 @@ impl SentryTracker {
                     blockers: vec![],
                     source: "sentry".to_string(),
                     extra,
+                    comments: vec![],
                 });
             }
         }
@@ -498,6 +499,7 @@ Found **2** issues:
                     blockers: vec![],
                     source: "sentry".to_string(),
                     extra,
+                    comments: vec![],
                 });
             }
         }

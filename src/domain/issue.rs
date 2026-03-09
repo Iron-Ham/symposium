@@ -18,6 +18,16 @@ pub struct Issue {
     /// Extra properties extracted from the tracker (e.g. "platform", "severity").
     #[serde(default)]
     pub extra: HashMap<String, String>,
+    /// Comments on the issue page, fetched before dispatch.
+    #[serde(default)]
+    pub comments: Vec<Comment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Comment {
+    pub author: String,
+    pub body: String,
+    pub created_at: Option<String>,
 }
 
 fn default_source() -> String {

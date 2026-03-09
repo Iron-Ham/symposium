@@ -269,6 +269,37 @@ async fn run_worker(
 
     let ws = WorkspaceManager::new(config_rx.clone());
 
+    // Fetch comments from Notion before building the prompt
+    let mut issue = issue.clone();
+    if issue.source == "notion"
+        && let Some(ref page_id) = issue.notion_page_id
+    {
+        match NotionTracker::new(config.tracker.clone()).await {
+            Ok(mut tracker) => match tracker.fetch_comments(page_id).await {
+                Ok(comments) => {
+                    tracing::info!(
+                        issue_id = issue.identifier,
+                        count = comments.len(),
+                        "fetched issue comments"
+                    );
+                    issue.comments = comments;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        issue_id = issue.identifier,
+                        "failed to fetch comments: {e}"
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    issue_id = issue.identifier,
+                    "failed to connect to tracker for comments: {e}"
+                );
+            }
+        }
+    }
+
     // Ensure workspace exists (creates + runs after_create hook if new)
     state.push_agent_event(
         &issue.identifier,
@@ -276,16 +307,16 @@ async fn run_worker(
             status: "Setting up workspace".into(),
         }),
     );
-    let workspace_dir = ws.ensure(issue).await?;
+    let workspace_dir = ws.ensure(&issue).await?;
 
     // Run before_run hook
-    ws.prepare(issue, attempt).await?;
+    ws.prepare(&issue, attempt).await?;
 
     // Build prompt from template, with PR metadata instructions appended.
     // The implementer has the best context for writing the initial PR description
     // since it performed the investigation and chose the fix.
-    let mut prompt_text = prompt::build_prompt(&config.prompt_template, issue, attempt)?;
-    prompt_text.push_str(&pr_metadata_instructions(issue));
+    let mut prompt_text = prompt::build_prompt(&config.prompt_template, &issue, attempt)?;
+    prompt_text.push_str(&pr_metadata_instructions(&issue));
 
     // Start agent session
     state.push_agent_event(
@@ -328,7 +359,7 @@ async fn run_worker(
             if let Some(ref hook_script) = config.review.before_review {
                 let rendered = prompt::build_prompt_with_workspace(
                     hook_script,
-                    issue,
+                    &issue,
                     attempt,
                     Some(&workspace_dir.to_string_lossy()),
                 )
@@ -343,7 +374,7 @@ async fn run_worker(
                 }
             }
 
-            let mut review_prompt = build_review_prompt(issue, &config.review.prompt_template);
+            let mut review_prompt = build_review_prompt(&issue, &config.review.prompt_template);
             // Ask the reviewer to update the PR metadata the implementer wrote,
             // accounting for any changes the review introduced.
             review_prompt.push_str(&pr_metadata_update_instructions());
@@ -388,7 +419,7 @@ async fn run_worker(
 
         // Read agent-generated PR metadata, falling back to defaults
         let (pr_title, pr_body_text) =
-            read_pr_metadata(&workspace_dir, issue).await;
+            read_pr_metadata(&workspace_dir, &issue).await;
 
         // Write title/body to temp files outside the workspace to avoid accidental git add
         let tmp = std::env::temp_dir();
@@ -427,7 +458,7 @@ async fn run_worker(
     }
 
     // Run after_run hook
-    ws.finish(issue, success).await?;
+    ws.finish(&issue, success).await?;
 
     Ok(success)
 }
