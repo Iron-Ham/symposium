@@ -7,6 +7,7 @@ use crate::domain::state::OrchestratorState;
 use crate::error::Result;
 use crate::prompt;
 use crate::tracker::notion::NotionTracker;
+use crate::tracker::sentry::SentryTracker;
 use crate::tracker::TrackerClient;
 use crate::workspace::WorkspaceManager;
 
@@ -59,6 +60,17 @@ pub async fn run_tick(
         }
     };
 
+    // 4b. Fetch from Sentry (if enabled)
+    if config.sentry.enabled {
+        match SentryTracker::new(config.sentry.clone()).await {
+            Ok(mut sentry) => match sentry.fetch_candidate_issues().await {
+                Ok(sentry_issues) => candidates.extend(sentry_issues),
+                Err(e) => tracing::error!("failed to fetch Sentry issues: {e}"),
+            },
+            Err(e) => tracing::error!("failed to create Sentry tracker: {e}"),
+        }
+    }
+
     // 5. Sort by priority and filter eligible
     dispatch::sort_candidates(&mut candidates);
 
@@ -78,6 +90,14 @@ pub async fn run_tick(
 
     // 8. Clean up workspaces for terminal issues
     cleanup_terminal(&mut tracker, state, config_rx).await;
+
+    // 8b. Clean up Sentry terminal issues
+    if config.sentry.enabled {
+        match SentryTracker::new(config.sentry.clone()).await {
+            Ok(mut sentry) => cleanup_terminal_sentry(&mut sentry, state, config_rx).await,
+            Err(e) => tracing::debug!("failed to create Sentry tracker for cleanup: {e}"),
+        }
+    }
 
     Ok(())
 }
@@ -152,25 +172,7 @@ fn dispatch_retry(
     let attempt = retry.attempt;
 
     tokio::spawn(async move {
-        // Re-fetch the issue from the tracker for retry
-        let mut tracker = match NotionTracker::new(config.tracker.clone()).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!(issue_id, "retry: failed to connect to tracker: {e}");
-                return;
-            }
-        };
-
-        let issues = match tracker.fetch_issue_states_by_ids(std::slice::from_ref(&issue_id)).await {
-            Ok(issues) => issues,
-            Err(e) => {
-                tracing::error!(issue_id, "retry: failed to fetch issue: {e}");
-                return;
-            }
-        };
-
-        let Some(issue) = issues.into_iter().next() else {
-            tracing::warn!(issue_id, "retry: issue not found in tracker");
+        let Some(issue) = fetch_issue_for_retry(&issue_id, &config).await else {
             return;
         };
 
@@ -198,6 +200,60 @@ fn dispatch_retry(
             super::retry::schedule_retry(issue.identifier, attempt + 1, delay, event_tx);
         }
     });
+}
+
+/// Re-fetch a single issue from the correct tracker for retry dispatch.
+/// Returns `None` and logs errors if the issue cannot be fetched.
+async fn fetch_issue_for_retry(issue_id: &str, config: &ServiceConfig) -> Option<Issue> {
+    if issue_id.starts_with("sentry:") {
+        let mut tracker = match SentryTracker::new(config.sentry.clone()).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(issue_id, "retry: failed to create Sentry tracker: {e}");
+                return None;
+            }
+        };
+        match tracker
+            .fetch_issue_states_by_ids(std::slice::from_ref(&issue_id.to_string()))
+            .await
+        {
+            Ok(issues) => {
+                let issue = issues.into_iter().next();
+                if issue.is_none() {
+                    tracing::warn!(issue_id, "retry: issue not found in Sentry");
+                }
+                issue
+            }
+            Err(e) => {
+                tracing::error!(issue_id, "retry: failed to fetch Sentry issue: {e}");
+                None
+            }
+        }
+    } else {
+        let mut tracker = match NotionTracker::new(config.tracker.clone()).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(issue_id, "retry: failed to connect to tracker: {e}");
+                return None;
+            }
+        };
+        match tracker
+            .fetch_issue_states_by_ids(std::slice::from_ref(&issue_id.to_string()))
+            .await
+        {
+            Ok(issues) => {
+                let issue = issues.into_iter().next();
+                if issue.is_none() {
+                    tracing::warn!(issue_id, "retry: issue not found in tracker");
+                }
+                issue
+            }
+            Err(e) => {
+                tracing::error!(issue_id, "retry: failed to fetch issue: {e}");
+                None
+            }
+        }
+    }
 }
 
 /// Run a worker: prepare workspace, build prompt, start agent, run turns.
@@ -247,7 +303,7 @@ async fn run_worker(
     };
 
     let runner = agent::AgentRunner::new(config.clone());
-    let mut worker = runner
+    let (mut worker, _mcp_guard) = runner
         .start_session(&agent_dir, &prompt_text, &issue.identifier)
         .await?;
 
@@ -295,7 +351,7 @@ async fn run_worker(
                 .start_session(&agent_dir, &review_prompt, &issue.identifier)
                 .await
             {
-                Ok(mut review_worker) => {
+                Ok((mut review_worker, _review_mcp_guard)) => {
                     match run_agent_attempt(
                         &mut review_worker,
                         &review_prompt,
@@ -494,28 +550,48 @@ Finally, read the `PR_TITLE` and `PR_BODY.md` files in the root of the git repos
 }
 
 
+/// Remove workspaces for issues that have reached terminal states.
+fn remove_terminal_workspaces(
+    terminal_issues: Vec<Issue>,
+    state: &OrchestratorState,
+    config_rx: &watch::Receiver<ServiceConfig>,
+) {
+    let ws = WorkspaceManager::new(config_rx.clone());
+    let state = state.clone();
+    tokio::spawn(async move {
+        for issue in terminal_issues {
+            if !state.is_running(&issue.identifier)
+                && let Err(e) = ws.remove(&issue.identifier).await
+            {
+                tracing::warn!(
+                    issue_id = issue.identifier,
+                    "failed to remove terminal workspace: {e}"
+                );
+            }
+        }
+    });
+}
+
 /// Clean up workspaces for issues that have reached terminal states.
 async fn cleanup_terminal(
     tracker: &mut NotionTracker,
     state: &OrchestratorState,
     config_rx: &watch::Receiver<ServiceConfig>,
 ) {
-    let terminal_issues = match tracker.fetch_terminal_issues().await {
-        Ok(issues) => issues,
-        Err(e) => {
-            tracing::debug!("failed to fetch terminal issues for cleanup: {e}");
-            return;
-        }
-    };
+    match tracker.fetch_terminal_issues().await {
+        Ok(issues) => remove_terminal_workspaces(issues, state, config_rx),
+        Err(e) => tracing::debug!("failed to fetch terminal issues for cleanup: {e}"),
+    }
+}
 
-    let ws = WorkspaceManager::new(config_rx.clone());
-    for issue in terminal_issues {
-        if !state.is_running(&issue.identifier)
-            && let Err(e) = ws.remove(&issue.identifier).await {
-                tracing::warn!(
-                    issue_id = issue.identifier,
-                    "failed to remove terminal workspace: {e}"
-                );
-            }
+/// Clean up workspaces for Sentry issues that have been resolved.
+async fn cleanup_terminal_sentry(
+    tracker: &mut SentryTracker,
+    state: &OrchestratorState,
+    config_rx: &watch::Receiver<ServiceConfig>,
+) {
+    match tracker.fetch_terminal_issues().await {
+        Ok(issues) => remove_terminal_workspaces(issues, state, config_rx),
+        Err(e) => tracing::debug!("failed to fetch terminal Sentry issues for cleanup: {e}"),
     }
 }

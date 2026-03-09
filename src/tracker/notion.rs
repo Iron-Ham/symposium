@@ -154,6 +154,7 @@ impl NotionTracker {
             url,
             notion_page_id: page_id,
             blockers: vec![],
+            source: "notion".to_string(),
             extra,
         })
     }
