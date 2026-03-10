@@ -101,6 +101,24 @@ review:
   # (e.g. generate a lint report the agent can read)
   # before_review: |
   #   cd {{ workspace }} && npx eslint --format json -o review-report.json src/
+
+# Optional: monitor open PRs for reviewer feedback and auto-dispatch fix agents.
+# When enabled, each tick checks PRs created by Symposium for new comments or
+# change requests. If actionable feedback is found, an agent is spun up in the
+# existing workspace to address it.
+# pr_review:
+#   enabled: true
+#   # Which reviewers trigger a fix agent: "all", "humans", or a list of usernames.
+#   # "humans" skips GitHub bot accounts (usernames ending in [bot]).
+#   # Default: "all"
+#   reviewers: humans
+#   # reviewers: ["alice", "bob"]   # only react to specific reviewers
+#   # Custom Liquid template for the PR review prompt.
+#   # Available variables: {{ issue.identifier }}, {{ issue.title }}, {{ issue.extra.pr_number }}
+#   # If empty, uses a built-in default that reads comments via `gh pr view`.
+#   # prompt_template: |
+#   #   Address reviewer feedback on PR #{{ issue.extra.pr_number }} for {{ issue.identifier }}.
+#   #   Run `gh pr view {{ issue.extra.pr_number }} --comments` to see feedback.
 ---
 ```
 
@@ -157,3 +175,22 @@ If the files are missing, Symposium falls back to a generic title/body based on 
 issue ID and title.
 
 These files are **not** committed to git — they are read from disk and then cleaned up.
+
+## PR Review Monitoring
+
+When `pr_review.enabled` is set to `true`, Symposium monitors open PRs it created for
+reviewer feedback. Each tick, it runs `gh pr view` to check for new comments or change
+requests. If actionable feedback is detected, it spins up an agent in the **existing
+workspace** to address the feedback — no new workspace or branch is created.
+
+Reviews are grouped per-author, and only the latest review state per author is considered.
+This means if a reviewer requests changes and later approves, the approval supersedes the
+earlier request and no fix agent is triggered.
+
+The `reviewers` filter controls which reviewers' feedback triggers a response:
+
+| Value | Behavior |
+|-------|----------|
+| `"all"` (default) | React to any reviewer |
+| `"humans"` | Skip bot accounts (GitHub usernames ending in `[bot]`) |
+| `["alice", "bob"]` | Only react to these specific GitHub usernames |
