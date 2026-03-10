@@ -319,6 +319,118 @@ async fn run_worker(
     // Run before_run hook
     ws.prepare(&issue, attempt).await?;
 
+    // Run pre-flight verification (if enabled)
+    if config.preflight.enabled {
+        if config.preflight.prompt_template.is_empty() {
+            tracing::warn!(
+                issue_id = issue.identifier,
+                "preflight is enabled but prompt_template is empty — skipping preflight"
+            );
+        } else if let Ok(mut preflight_prompt) =
+            prompt::build_prompt(&config.preflight.prompt_template, &issue, attempt)
+        {
+            state.push_agent_event(
+                &issue.identifier,
+                AgentEvent::now(AgentEventKind::Status {
+                    status: "Running preflight check".into(),
+                }),
+            );
+
+            preflight_prompt.push_str(preflight_signal_instructions());
+
+            // Use agent_subdirectory if configured
+            let preflight_dir = match &config.workspace.agent_subdirectory {
+                Some(sub) => workspace_dir.join(sub),
+                None => workspace_dir.clone(),
+            };
+
+            let preflight_runner = agent::AgentRunner::new(config.clone());
+            match preflight_runner
+                .start_session(&preflight_dir, &preflight_prompt, &issue.identifier)
+                .await
+            {
+                Ok((mut preflight_worker, _preflight_mcp_guard)) => {
+                    match run_agent_attempt(
+                        &mut preflight_worker,
+                        &preflight_prompt,
+                        state,
+                        &issue.identifier,
+                    )
+                    .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                issue_id = issue.identifier,
+                                "preflight agent failed: {e} — proceeding to main agent"
+                            );
+                            state.push_agent_event(
+                                &issue.identifier,
+                                AgentEvent::now(AgentEventKind::Error {
+                                    message: format!("Preflight agent failed: {e}"),
+                                }),
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        issue_id = issue.identifier,
+                        "failed to start preflight agent: {e} — proceeding to main agent"
+                    );
+                    state.push_agent_event(
+                        &issue.identifier,
+                        AgentEvent::now(AgentEventKind::Error {
+                            message: format!("Failed to start preflight agent: {e}"),
+                        }),
+                    );
+                }
+            }
+
+            // Check if the preflight agent signaled to skip this issue
+            let skip_path = preflight_dir.join("PREFLIGHT_SKIP");
+            if tokio::fs::try_exists(&skip_path).await.unwrap_or(false) {
+                let reason = tokio::fs::read_to_string(&skip_path)
+                    .await
+                    .unwrap_or_default();
+                let reason = reason.trim();
+                tracing::info!(
+                    issue_id = issue.identifier,
+                    reason,
+                    "preflight: skipping issue"
+                );
+                if let Err(e) = tokio::fs::remove_file(&skip_path).await {
+                    tracing::warn!(
+                        issue_id = issue.identifier,
+                        "failed to remove PREFLIGHT_SKIP file: {e}"
+                    );
+                }
+
+                state.push_agent_event(
+                    &issue.identifier,
+                    AgentEvent::now(AgentEventKind::Status {
+                        status: format!(
+                            "Preflight: skipped — {}",
+                            if reason.is_empty() {
+                                "no reason given"
+                            } else {
+                                reason
+                            }
+                        ),
+                    }),
+                );
+
+                ws.finish(&issue, true).await?;
+                return Ok(true);
+            }
+        } else {
+            tracing::warn!(
+                issue_id = issue.identifier,
+                "failed to render preflight prompt template — skipping preflight"
+            );
+        }
+    }
+
     // Build prompt from template, with PR metadata instructions appended.
     // The implementer has the best context for writing the initial PR description
     // since it performed the investigation and chose the fix.
@@ -556,6 +668,18 @@ If you made any changes, commit them with `git add` and `git commit` with a desc
         id = issue.identifier,
         title = issue.title,
     )
+}
+
+/// Instructions appended to the preflight prompt for signaling skip/proceed.
+fn preflight_signal_instructions() -> &'static str {
+    r#"
+
+After your investigation, decide whether this issue should proceed to the implementation phase:
+
+- If the issue is NOT reproducible, already fixed, or not a real issue: write a file called `PREFLIGHT_SKIP` in your current working directory containing a brief explanation of why this issue should be skipped. Do NOT create any branches or make code changes.
+- If the issue IS valid and should be fixed: do NOT create a `PREFLIGHT_SKIP` file. Simply finish — the system will proceed to the implementation phase automatically.
+
+Do NOT commit any files. Do NOT create pull requests."#
 }
 
 /// Instructions appended to the implementer prompt for writing PR metadata files.

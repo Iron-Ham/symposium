@@ -92,6 +92,30 @@ You are working on issue {{ issue.identifier }}.
     }
 
     #[test]
+    fn parse_preflight_config() {
+        let content = r#"---
+preflight:
+  enabled: true
+  prompt_template: "Verify {{ issue.identifier }}: {{ issue.title }}"
+---
+Prompt here."#;
+        let (config, _) = parse_workflow(content).unwrap();
+        assert!(config.preflight.enabled);
+        assert_eq!(
+            config.preflight.prompt_template,
+            "Verify {{ issue.identifier }}: {{ issue.title }}"
+        );
+    }
+
+    #[test]
+    fn parse_preflight_config_defaults() {
+        let content = "---\n---\nPrompt here.";
+        let (config, _) = parse_workflow(content).unwrap();
+        assert!(!config.preflight.enabled);
+        assert!(config.preflight.prompt_template.is_empty());
+    }
+
+    #[test]
     fn parse_review_config() {
         let content = r#"---
 review:
