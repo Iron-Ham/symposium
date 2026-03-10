@@ -135,7 +135,14 @@ impl HttpMcpClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(Error::Mcp(format!("MCP HTTP error {status}: {body}")));
+            // Truncate HTML error pages (e.g. Cloudflare 5xx) to keep logs readable
+            let body_preview: String = if body.contains("<!DOCTYPE") || body.contains("<html") {
+                let plain: String = body.chars().take(200).collect();
+                format!("{plain}... (HTML truncated, {} bytes total)", body.len())
+            } else {
+                body.chars().take(500).collect()
+            };
+            return Err(Error::Mcp(format!("MCP HTTP error {status}: {body_preview}")));
         }
 
         let content_type = response
