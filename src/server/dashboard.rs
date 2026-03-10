@@ -37,6 +37,7 @@ const STYLE: &str = r#"
     .meta-row { display: flex; gap: 2rem; margin: 0.25rem 0; }
     .meta-label { color: #888; min-width: 6rem; }
     .events-container { background: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 1rem 1.5rem; max-height: 70vh; overflow-y: auto; }
+    .workflow-badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; background: #e5e7eb; color: #374151; font-size: 0.75rem; font-weight: 500; }
 "#;
 
 /// Render the main dashboard.
@@ -51,17 +52,18 @@ pub fn render(snapshot: &StateSnapshot) -> String {
                 .last()
                 .map(|e| match &e.kind {
                     AgentEventKind::Status { status } => status.clone(),
-                    AgentEventKind::ToolCall { name, .. } => format!("→ {name}"),
-                    AgentEventKind::ToolResult { name, .. } => format!("← {name}"),
+                    AgentEventKind::ToolCall { name, .. } => format!("-> {name}"),
+                    AgentEventKind::ToolResult { name, .. } => format!("<- {name}"),
                     AgentEventKind::TurnComplete { turn } => format!("Turn {turn} done"),
                     AgentEventKind::Error { message } => format!("Error: {message}"),
                     AgentEventKind::Text { .. } => "Thinking...".into(),
                 })
                 .unwrap_or_default();
             format!(
-                "<tr><td><a href=\"/issue/{}\">{}</a></td><td>{}</td><td>{:?}</td><td>{}</td></tr>",
-                entry.issue.identifier,
-                entry.issue.identifier,
+                "<tr><td><span class=\"workflow-badge\">{}</span></td><td><a href=\"/issue/{}\">{}</a></td><td>{}</td><td>{:?}</td><td>{}</td></tr>",
+                html_escape(&entry.workflow_id),
+                html_escape(&entry.session.issue_id.replace('/', "%2F")),
+                html_escape(&entry.issue.identifier),
                 html_escape(&entry.issue.title),
                 entry.session.status,
                 html_escape(&last_event),
@@ -74,9 +76,10 @@ pub fn render(snapshot: &StateSnapshot) -> String {
         .iter()
         .map(|entry| {
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                entry.issue_id,
-                if entry.success { "✓ Success" } else { "✗ Failed" },
+                "<tr><td><span class=\"workflow-badge\">{}</span></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                html_escape(&entry.workflow_id),
+                html_escape(&entry.issue_id),
+                if entry.success { "&#10003; Success" } else { "&#10007; Failed" },
                 entry.attempts,
                 entry.completed_at.format("%H:%M:%S")
             )
@@ -131,19 +134,22 @@ pub fn render(snapshot: &StateSnapshot) -> String {
         running_table = if snapshot.running.is_empty() {
             "<div class=\"empty\">No running sessions</div>".to_string()
         } else {
-            format!("<table><tr><th>Issue</th><th>Title</th><th>Status</th><th>Latest</th></tr>{running_rows}</table>")
+            format!("<table><tr><th>Workflow</th><th>Issue</th><th>Title</th><th>Status</th><th>Latest</th></tr>{running_rows}</table>")
         },
         completed_table = if snapshot.completed.is_empty() {
             "<div class=\"empty\">No completed sessions yet</div>".to_string()
         } else {
-            format!("<table><tr><th>Issue</th><th>Result</th><th>Attempts</th><th>Completed</th></tr>{completed_rows}</table>")
+            format!("<table><tr><th>Workflow</th><th>Issue</th><th>Result</th><th>Attempts</th><th>Completed</th></tr>{completed_rows}</table>")
         },
     )
 }
 
 /// Render a detail page for a specific issue.
 pub fn render_issue_detail(snapshot: &StateSnapshot, issue_id: &str) -> String {
-    let entry = snapshot.running.iter().find(|e| e.issue.identifier == issue_id);
+    let entry = snapshot
+        .running
+        .iter()
+        .find(|e| e.session.issue_id == issue_id || e.issue.identifier == issue_id);
 
     let Some(entry) = entry else {
         return format!(
@@ -168,14 +174,14 @@ pub fn render_issue_detail(snapshot: &StateSnapshot, issue_id: &str) -> String {
                 }
                 AgentEventKind::ToolCall { name, arguments } => {
                     format!(
-                        "<div class=\"event\"><span class=\"event-time\">{time}</span><span class=\"event-tool\">→ {}</span><span class=\"event-detail\">{}</span></div>",
+                        "<div class=\"event\"><span class=\"event-time\">{time}</span><span class=\"event-tool\">-> {}</span><span class=\"event-detail\">{}</span></div>",
                         html_escape(name),
                         html_escape(arguments)
                     )
                 }
                 AgentEventKind::ToolResult { name, truncated } => {
                     format!(
-                        "<div class=\"event\"><span class=\"event-time\">{time}</span><span class=\"event-result\">← {}</span><span class=\"event-detail\">{}</span></div>",
+                        "<div class=\"event\"><span class=\"event-time\">{time}</span><span class=\"event-result\"><- {}</span><span class=\"event-detail\">{}</span></div>",
                         html_escape(name),
                         html_escape(truncated)
                     )
@@ -222,6 +228,7 @@ pub fn render_issue_detail(snapshot: &StateSnapshot, issue_id: &str) -> String {
     <h2>{id}: {title}</h2>
 
     <div class="meta">
+        <div class="meta-row"><span class="meta-label">Workflow</span><span class="workflow-badge">{workflow}</span></div>
         <div class="meta-row"><span class="meta-label">Status</span><span>{status:?}</span></div>
         <div class="meta-row"><span class="meta-label">Priority</span><span>{priority}</span></div>
         <div class="meta-row"><span class="meta-label">Started</span><span>{started}</span></div>
@@ -251,6 +258,7 @@ pub fn render_issue_detail(snapshot: &StateSnapshot, issue_id: &str) -> String {
 </html>"#,
         id = entry.issue.identifier,
         title = html_escape(&entry.issue.title),
+        workflow = html_escape(&entry.workflow_id),
         status = entry.session.status,
         priority = html_escape(entry.issue.priority.as_deref().unwrap_or("—")),
         started = entry.session.started_at.format("%H:%M:%S"),

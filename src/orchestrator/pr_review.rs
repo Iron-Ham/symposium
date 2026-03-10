@@ -4,6 +4,7 @@ use crate::config::schema::{ReviewerFilter, ServiceConfig};
 use crate::domain::issue::Issue;
 use crate::domain::session::{AgentEvent, AgentEventKind, RunStatus};
 use crate::domain::state::{OpenPr, OrchestratorState};
+use crate::domain::workflow::WorkflowId;
 use crate::error::Result;
 use crate::prompt;
 use crate::workspace::hooks;
@@ -30,24 +31,44 @@ pub async fn check_and_dispatch_pr_reviews(
     config: &ServiceConfig,
     config_rx: &watch::Receiver<ServiceConfig>,
     event_tx: &mpsc::Sender<OrchestratorEvent>,
+    workflow_id: &WorkflowId,
+    global_max_agents: Option<usize>,
 ) {
     let open_prs = state.open_prs();
-    if open_prs.is_empty() {
+    // Only process PRs belonging to this workflow
+    let workflow_prs: Vec<_> = open_prs
+        .into_iter()
+        .filter(|pr| pr.workflow_id == workflow_id.0)
+        .collect();
+    if workflow_prs.is_empty() {
         return;
     }
 
-    tracing::debug!(count = open_prs.len(), "checking open PRs for review feedback");
+    tracing::debug!(
+        workflow = %workflow_id,
+        count = workflow_prs.len(),
+        "checking open PRs for review feedback"
+    );
 
-    for pr in open_prs {
-        if state.running_count() >= config.agent.max_concurrent_agents {
-            tracing::debug!("at capacity, skipping remaining PR review checks");
+    for pr in workflow_prs {
+        if state.running_count_for_workflow(&workflow_id.0) >= config.agent.max_concurrent_agents {
+            tracing::debug!("at per-workflow capacity, skipping remaining PR review checks");
+            break;
+        }
+        if let Some(global_max) = global_max_agents
+            && state.running_count() >= global_max
+        {
+            tracing::debug!("at global capacity, skipping remaining PR review checks");
             break;
         }
 
-        let review_id = review_session_id(&pr.issue.identifier);
-        if state.is_running(&review_id) {
+        let review_state_key = review_session_state_key(&pr.issue.identifier, workflow_id);
+        if state.is_running(&review_state_key) {
             continue;
         }
+
+        // The pr_state_key is the key under which the PR is tracked in open_prs
+        let pr_state_key = workflow_id.state_key(&pr.issue.identifier);
 
         match check_pr_status(&pr.workspace_dir, pr.pr_number, &config.pr_review.reviewers).await {
             Ok(status) => {
@@ -58,12 +79,12 @@ pub async fn check_and_dispatch_pr_reviews(
                         state = status.state,
                         "PR reached terminal state, untracking"
                     );
-                    state.untrack_pr(&pr.issue.identifier);
+                    state.untrack_pr(&pr_state_key);
                     continue;
                 }
 
                 if needs_attention(&pr, &status) {
-                    dispatch_pr_review(pr, state, config, config_rx, event_tx);
+                    dispatch_pr_review(pr, state, config, config_rx, event_tx, workflow_id);
                 }
             }
             Err(e) => {
@@ -77,9 +98,9 @@ pub async fn check_and_dispatch_pr_reviews(
     }
 }
 
-/// Session identifier for a PR review worker.
-fn review_session_id(issue_id: &str) -> String {
-    format!("pr-review:{issue_id}")
+/// State key for a PR review worker session.
+fn review_session_state_key(issue_id: &str, workflow_id: &WorkflowId) -> String {
+    workflow_id.state_key(&format!("pr-review:{issue_id}"))
 }
 
 /// Query a PR's review status via `gh pr view`.
@@ -189,31 +210,45 @@ fn dispatch_pr_review(
     config: &ServiceConfig,
     config_rx: &watch::Receiver<ServiceConfig>,
     event_tx: &mpsc::Sender<OrchestratorEvent>,
+    workflow_id: &WorkflowId,
 ) {
-    let review_id = review_session_id(&pr.issue.identifier);
+    let review_state_key = review_session_state_key(&pr.issue.identifier, workflow_id);
+    let pr_state_key = workflow_id.state_key(&pr.issue.identifier);
     tracing::info!(
         issue_id = pr.issue.identifier,
         pr = pr.pr_number,
-        review_id,
+        review_state_key,
         "dispatching PR review worker"
     );
 
-    state.start_session(Issue {
-        identifier: review_id.clone(),
-        title: format!("PR review: {}", pr.issue.title),
-        source: "pr_review".to_string(),
-        ..pr.issue.clone()
-    });
+    let stall_timeout = config.codex.stall_timeout();
+    state.start_session(
+        &review_state_key,
+        Issue {
+            identifier: format!("pr-review:{}", pr.issue.identifier),
+            title: format!("PR review: {}", pr.issue.title),
+            source: "pr_review".to_string(),
+            workflow_id: workflow_id.0.clone(),
+            ..pr.issue.clone()
+        },
+        stall_timeout,
+        &workflow_id.0,
+    );
 
     let config = config.clone();
     let config_rx = config_rx.clone();
     let event_tx = event_tx.clone();
     let state_clone = state.clone();
-    let original_issue_id = pr.issue.identifier.clone();
 
     tokio::spawn(async move {
-        let result =
-            run_pr_review_worker(&pr, &review_id, &config, &config_rx, &state_clone).await;
+        let result = run_pr_review_worker(
+            &pr,
+            &review_state_key,
+            &config,
+            &config_rx,
+            &state_clone,
+        )
+        .await;
 
         let (success, error) = match &result {
             Ok(true) => (true, None),
@@ -222,16 +257,19 @@ fn dispatch_pr_review(
         };
 
         if success {
-            state_clone.mark_pr_addressed(&original_issue_id);
+            state_clone.mark_pr_addressed(&pr_state_key);
         }
 
-        let _ = event_tx
+        if let Err(e) = event_tx
             .send(OrchestratorEvent::WorkerCompleted {
-                issue_id: review_id,
+                state_key: review_state_key.clone(),
                 success,
                 error,
             })
-            .await;
+            .await
+        {
+            tracing::error!(state_key = %review_state_key, "failed to send WorkerCompleted event: {e}");
+        }
 
         // No retry scheduling here — unlike issue workers, the PR review polling loop
         // will re-detect unaddressed reviews on the next tick and dispatch again.
@@ -241,7 +279,7 @@ fn dispatch_pr_review(
 /// Run the PR review agent: prepare workspace, build prompt, start agent, push fixes.
 async fn run_pr_review_worker(
     pr: &OpenPr,
-    review_id: &str,
+    review_state_key: &str,
     config: &ServiceConfig,
     config_rx: &watch::Receiver<ServiceConfig>,
     state: &OrchestratorState,
@@ -259,7 +297,7 @@ async fn run_pr_review_worker(
 
     // Run before_run hook (e.g. git fetch, git rebase)
     state.push_agent_event(
-        review_id,
+        review_state_key,
         AgentEvent::now(AgentEventKind::Status {
             status: "Preparing workspace for PR review".into(),
         }),
@@ -276,12 +314,12 @@ async fn run_pr_review_worker(
 
     // Start agent
     state.push_agent_event(
-        review_id,
+        review_state_key,
         AgentEvent::now(AgentEventKind::Status {
             status: "Starting PR review agent".into(),
         }),
     );
-    state.update_session_status(review_id, RunStatus::Running);
+    state.update_session_status(review_state_key, RunStatus::Running);
 
     let agent_dir = match &config.workspace.agent_subdirectory {
         Some(sub) => workspace_dir.join(sub),
@@ -290,10 +328,10 @@ async fn run_pr_review_worker(
 
     let runner = agent::AgentRunner::new(config.clone());
     let (mut worker, _mcp_guard) = runner
-        .start_session(&agent_dir, &prompt_text, review_id)
+        .start_session(&agent_dir, &prompt_text, review_state_key)
         .await?;
 
-    let success = run_agent_attempt(&mut worker, &prompt_text, state, review_id).await?;
+    let success = run_agent_attempt(&mut worker, &prompt_text, state, review_state_key).await?;
 
     // Run after_run hook
     ws.finish(&pr.issue, success).await?;
@@ -393,6 +431,7 @@ mod tests {
             pr_number: 1,
             workspace_dir: "/tmp".into(),
             last_addressed_at: None,
+            workflow_id: "default".to_string(),
         };
         let status = PrStatus {
             state: "OPEN".into(),
@@ -408,6 +447,7 @@ mod tests {
             pr_number: 1,
             workspace_dir: "/tmp".into(),
             last_addressed_at: None,
+            workflow_id: "default".to_string(),
         };
         let status = PrStatus {
             state: "OPEN".into(),
@@ -424,6 +464,7 @@ mod tests {
             pr_number: 1,
             workspace_dir: "/tmp".into(),
             last_addressed_at: Some(now),
+            workflow_id: "default".to_string(),
         };
         let status = PrStatus {
             state: "OPEN".into(),
@@ -440,6 +481,7 @@ mod tests {
             pr_number: 1,
             workspace_dir: "/tmp".into(),
             last_addressed_at: Some(now - chrono::Duration::hours(1)),
+            workflow_id: "default".to_string(),
         };
         let status = PrStatus {
             state: "OPEN".into(),
@@ -601,6 +643,7 @@ mod tests {
             pr_number: 42,
             workspace_dir: "/tmp/ws".into(),
             last_addressed_at: None,
+            workflow_id: "default".to_string(),
         };
         let status = PrStatus {
             state,
@@ -653,6 +696,7 @@ mod tests {
             source: "notion".to_string(),
             extra: HashMap::new(),
             comments: vec![],
+            workflow_id: "default".to_string(),
         }
     }
 }

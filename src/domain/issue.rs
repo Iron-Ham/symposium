@@ -21,6 +21,9 @@ pub struct Issue {
     /// Comments on the issue page, fetched before dispatch.
     #[serde(default)]
     pub comments: Vec<Comment>,
+    /// Which workflow produced this issue (empty for backward compat).
+    #[serde(default)]
+    pub workflow_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

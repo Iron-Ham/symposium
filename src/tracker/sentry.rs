@@ -53,7 +53,7 @@ impl SentryTracker {
         if result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false) {
             let text = Self::extract_text(&result);
             tracing::error!(response = %text, "Sentry MCP returned error");
-            return Ok(vec![]);
+            return Err(Error::Tracker(format!("Sentry MCP error: {text}")));
         }
 
         let text = Self::extract_text(&result);
@@ -182,7 +182,7 @@ impl SentryTracker {
                 }
 
                 issues.push(Issue {
-                    identifier: format!("sentry:{short_id}"),
+                    identifier: format!("{}{short_id}", self.config.id_prefix),
                     title,
                     description: Some(description),
                     status,
@@ -197,6 +197,7 @@ impl SentryTracker {
                     source: "sentry".to_string(),
                     extra,
                     comments: vec![],
+                    workflow_id: String::new(),
                 });
             }
         }
@@ -232,7 +233,7 @@ impl TrackerClient for SentryTracker {
     async fn fetch_issue_states_by_ids(&mut self, ids: &[String]) -> Result<Vec<Issue>> {
         let mut issues = Vec::new();
         for id in ids {
-            let short_id = id.strip_prefix("sentry:").unwrap_or(id);
+            let short_id = id.strip_prefix(&self.config.id_prefix).unwrap_or(id);
             match self.fetch_issue_detail(short_id).await {
                 Ok(Some(issue)) => issues.push(issue),
                 Ok(None) => {
@@ -485,7 +486,7 @@ Found **2** issues:
                 }
 
                 issues.push(Issue {
-                    identifier: format!("sentry:{short_id}"),
+                    identifier: format!("{}{short_id}", config.id_prefix),
                     title,
                     description: Some(description),
                     status,
@@ -500,6 +501,7 @@ Found **2** issues:
                     source: "sentry".to_string(),
                     extra,
                     comments: vec![],
+                    workflow_id: String::new(),
                 });
             }
         }
