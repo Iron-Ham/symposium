@@ -17,6 +17,12 @@ symposium WORKFLOW.bugs.md WORKFLOW.sentry.md WORKFLOW.tasks.md
 
 # With a global agent cap across all workflows
 symposium WORKFLOW.bugs.md WORKFLOW.tasks.md --max-agents 4
+
+# Override the dashboard port (default: from first workflow's server.port, or 8080)
+symposium WORKFLOW.bugs.md --port 9090
+
+# JSON-formatted logs (useful for log aggregation)
+symposium WORKFLOW.bugs.md --json-logs
 ```
 
 The workflow ID is derived from the filename: `WORKFLOW.bugs.md` becomes `"bugs"`,
@@ -50,6 +56,7 @@ tracker:
   property_status: "Status"
   property_priority: "Priority"
   property_description: "Description"
+  property_assignee: "Assignee"
   # Optional: only pick up issues assigned to this Notion user ID
   # assignee_user_id: "your-notion-user-uuid"
   # Optional: skip issues where this relation property is non-null (e.g. linked PRs)
@@ -77,11 +84,14 @@ hooks:
   # Optional: runs after each agent attempt
   # after_run: |
   #   echo "Agent finished with RUN_SUCCESS=$RUN_SUCCESS"
+  # Optional: timeout for hook execution in milliseconds (default: 300000 = 5 min)
+  # timeout_ms: 300000
 
 agent:
   max_concurrent_agents: 3
 
 codex:
+  # Path to the Claude CLI binary (default: "claude-code app-server")
   command: "/usr/local/bin/claude"
   turn_timeout_ms: 3600000    # 1 hour max per agent session
   stall_timeout_ms: 300000    # 5 min with no activity -> stalled
