@@ -13,6 +13,7 @@ pub struct ServiceConfig {
     pub agent: AgentConfig,
     pub codex: CodexConfig,
     pub server: ServerConfig,
+    pub preflight: PreflightConfig,
     pub review: ReviewConfig,
     pub pr_review: PrReviewConfig,
     pub mcp_servers: HashMap<String, McpServerConfig>,
@@ -231,6 +232,18 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self { port: 8080 }
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PreflightConfig {
+    /// Whether to run a pre-flight verification step before the main agent.
+    /// Defaults to false.
+    pub enabled: bool,
+    /// Liquid template for the pre-flight agent prompt.
+    /// The agent should verify that the issue is still valid/reproducible.
+    /// If the agent writes a `PREFLIGHT_SKIP` file, the issue is skipped.
+    pub prompt_template: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
