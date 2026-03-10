@@ -9,9 +9,11 @@ use crate::prompt;
 use crate::tracker::notion::NotionTracker;
 use crate::tracker::sentry::SentryTracker;
 use crate::tracker::TrackerClient;
+use crate::workspace::hooks as workspace_hooks;
 use crate::workspace::WorkspaceManager;
 
 use super::dispatch;
+use super::pr_review;
 use super::reconcile;
 use super::OrchestratorEvent;
 use std::time::Duration;
@@ -97,6 +99,11 @@ pub async fn run_tick(
             Ok(mut sentry) => cleanup_terminal_sentry(&mut sentry, state, config_rx).await,
             Err(e) => tracing::debug!("failed to create Sentry tracker for cleanup: {e}"),
         }
+    }
+
+    // 9. Check open PRs for review feedback
+    if config.pr_review.enabled {
+        pr_review::check_and_dispatch_pr_reviews(state, &config, config_rx, event_tx).await;
     }
 
     Ok(())
@@ -441,6 +448,11 @@ async fn run_worker(
                         status: "Draft PR opened".into(),
                     }),
                 );
+
+                // Track PR for review monitoring
+                if config.pr_review.enabled {
+                    track_created_pr(&issue, &workspace_dir, state, hook_timeout).await;
+                }
             }
             Err(e) => {
                 tracing::warn!(issue_id = issue.identifier, "PR creation failed: {e}");
@@ -582,15 +594,30 @@ Finally, read the `PR_TITLE` and `PR_BODY.md` files in the root of the git repos
 
 
 /// Remove workspaces for issues that have reached terminal states.
+///
+/// Skips removal for issues that still have tracked open PRs (the PR review
+/// monitor needs the workspace to exist for dispatching fix agents).
 fn remove_terminal_workspaces(
     terminal_issues: Vec<Issue>,
     state: &OrchestratorState,
     config_rx: &watch::Receiver<ServiceConfig>,
 ) {
     let ws = WorkspaceManager::new(config_rx.clone());
+    let tracked_pr_ids: std::collections::HashSet<String> = state
+        .open_prs()
+        .iter()
+        .map(|pr| pr.issue.identifier.clone())
+        .collect();
     let state = state.clone();
     tokio::spawn(async move {
         for issue in terminal_issues {
+            if tracked_pr_ids.contains(&issue.identifier) {
+                tracing::debug!(
+                    issue_id = issue.identifier,
+                    "skipping workspace removal — PR still tracked"
+                );
+                continue;
+            }
             if !state.is_running(&issue.identifier)
                 && let Err(e) = ws.remove(&issue.identifier).await
             {
@@ -612,6 +639,50 @@ async fn cleanup_terminal(
     match tracker.fetch_terminal_issues().await {
         Ok(issues) => remove_terminal_workspaces(issues, state, config_rx),
         Err(e) => tracing::debug!("failed to fetch terminal issues for cleanup: {e}"),
+    }
+}
+
+/// Extract the PR number after creation and register it for review monitoring.
+async fn track_created_pr(
+    issue: &Issue,
+    workspace_dir: &std::path::Path,
+    state: &OrchestratorState,
+    timeout: Duration,
+) {
+    let script = "gh pr view --json number";
+    match workspace_hooks::run_hook_with_output(script, workspace_dir, timeout).await {
+        Ok(output) => {
+            match serde_json::from_str::<serde_json::Value>(output.trim()) {
+                Ok(data) => {
+                    if let Some(number) = data["number"].as_u64() {
+                        state.track_pr(issue.clone(), number, workspace_dir.to_path_buf());
+                        tracing::info!(
+                            issue_id = issue.identifier,
+                            pr = number,
+                            "tracking PR for review monitoring"
+                        );
+                    } else {
+                        tracing::warn!(
+                            issue_id = issue.identifier,
+                            output = output.trim(),
+                            "gh pr view returned JSON without a valid 'number' field"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        issue_id = issue.identifier,
+                        "failed to parse gh pr view output: {e}"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                issue_id = issue.identifier,
+                "failed to get PR info for tracking: {e}"
+            );
+        }
     }
 }
 
