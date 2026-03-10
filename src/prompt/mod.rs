@@ -102,6 +102,7 @@ mod tests {
             source: "notion".to_string(),
             extra: HashMap::new(),
             comments: vec![],
+            workflow_id: String::new(),
         };
 
         let template = "Work on {{ issue.identifier }}: {{ issue.title }}\n{{ issue.description }}";
@@ -123,6 +124,7 @@ mod tests {
             source: "notion".to_string(),
             extra: HashMap::new(),
             comments: vec![],
+            workflow_id: String::new(),
         };
 
         let template = "{% if attempt %}Retry #{{ attempt }}{% endif %} {{ issue.identifier }}";
@@ -147,6 +149,7 @@ mod tests {
             source: "notion".to_string(),
             extra,
             comments: vec![],
+            workflow_id: String::new(),
         };
 
         let template = "Platform: {{ issue.platform }}";
@@ -181,6 +184,7 @@ mod tests {
                     created_at: None,
                 },
             ],
+            workflow_id: String::new(),
         };
 
         let template = "{% if issue.comments != blank %}Comments:\n{{ issue.comments }}{% endif %}";
@@ -203,6 +207,7 @@ mod tests {
             source: "notion".to_string(),
             extra: HashMap::new(),
             comments: vec![],
+            workflow_id: String::new(),
         };
 
         let template = "{% if issue.comments != blank %}Comments:\n{{ issue.comments }}{% else %}No comments{% endif %}";

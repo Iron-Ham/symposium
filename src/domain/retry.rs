@@ -7,6 +7,7 @@ pub struct RetryEntry {
     pub attempt: u32,
     pub next_retry_at: Option<DateTime<Utc>>,
     pub ready: bool,
+    pub workflow_id: String,
 }
 
 impl RetryEntry {
@@ -16,7 +17,13 @@ impl RetryEntry {
             attempt,
             next_retry_at: None,
             ready: false,
+            workflow_id: String::new(),
         }
+    }
+
+    pub fn with_workflow(mut self, workflow_id: String) -> Self {
+        self.workflow_id = workflow_id;
+        self
     }
 
     /// Calculate exponential backoff: base_delay * 2^attempt, capped at max_delay.

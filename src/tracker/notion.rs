@@ -130,7 +130,11 @@ impl NotionTracker {
         let priority_prop = self.config.property_priority.as_str();
         let desc_prop = self.config.property_description.as_str();
 
-        let identifier = self.extract_property(props?, id_prop)?;
+        let raw_id = self.extract_property(props?, id_prop)?;
+        let identifier = match &self.config.id_prefix {
+            Some(prefix) => format!("{prefix}{raw_id}"),
+            None => raw_id,
+        };
         let title = self.extract_property(props?, title_prop).unwrap_or_default();
         let status = self
             .extract_property(props?, status_prop)
@@ -157,6 +161,7 @@ impl NotionTracker {
             source: "notion".to_string(),
             extra,
             comments: vec![],
+            workflow_id: String::new(),
         })
     }
 

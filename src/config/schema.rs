@@ -44,6 +44,13 @@ pub struct SentryConfig {
     pub query: String,
     #[serde(default = "default_sentry_min_events")]
     pub min_events: u64,
+    /// Prefix for Sentry issue identifiers (default: "sentry:").
+    #[serde(default = "default_sentry_id_prefix")]
+    pub id_prefix: String,
+}
+
+fn default_sentry_id_prefix() -> String {
+    "sentry:".to_string()
 }
 
 impl Default for SentryConfig {
@@ -55,6 +62,7 @@ impl Default for SentryConfig {
             mcp_url: default_sentry_mcp_url(),
             query: String::new(),
             min_events: default_sentry_min_events(),
+            id_prefix: default_sentry_id_prefix(),
         }
     }
 }
@@ -96,6 +104,8 @@ pub struct TrackerConfig {
     pub assignee_user_id: Option<String>,
     /// Skip issues where this property is non-null (e.g. a linked PR relation).
     pub skip_if_set: Option<String>,
+    /// Prefix prepended to the raw ID property value (e.g. "BUG-" → "BUG-316205").
+    pub id_prefix: Option<String>,
 }
 
 impl Default for TrackerConfig {
@@ -115,6 +125,7 @@ impl Default for TrackerConfig {
             property_assignee: "Assignee".to_string(),
             assignee_user_id: None,
             skip_if_set: None,
+            id_prefix: None,
         }
     }
 }

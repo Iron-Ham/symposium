@@ -1,12 +1,17 @@
 use clap::Parser;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "symposium", about = "Symphony spec orchestrator for Notion + coding agents")]
 struct Cli {
-    /// Path to the WORKFLOW.md file
+    /// Paths to WORKFLOW.md files (one per workflow)
     #[arg(default_value = "WORKFLOW.md")]
-    workflow_path: PathBuf,
+    workflow_paths: Vec<PathBuf>,
+
+    /// Global maximum concurrent agents across all workflows
+    #[arg(long)]
+    max_agents: Option<usize>,
 
     /// HTTP server port (overrides config; defaults to config value or 8080)
     #[arg(long)]
@@ -23,28 +28,63 @@ async fn main() -> anyhow::Result<()> {
 
     symposium::logging::init(cli.json_logs);
 
-    // Canonicalize workflow path so the file watcher can resolve it
-    let workflow_path = std::fs::canonicalize(&cli.workflow_path)?;
+    // Canonicalize workflow paths
+    let workflow_paths: Vec<PathBuf> = cli
+        .workflow_paths
+        .iter()
+        .map(std::fs::canonicalize)
+        .collect::<Result<Vec<_>, _>>()?;
 
-    // Parse config
-    let config = symposium::config::workflow::parse_workflow_file(&workflow_path)?;
-    tracing::info!("loaded config from {}", workflow_path.display());
+    // Build per-workflow handles and watchers
+    let mut workflows = Vec::new();
+    let mut watchers = Vec::new();
+    let mut seen_ids = HashSet::new();
+    let mut first_port = None;
+
+    for path in &workflow_paths {
+        let config = symposium::config::workflow::parse_workflow_file(path)?;
+        let wf_id = symposium::domain::workflow::WorkflowId::from_path(path);
+
+        if !seen_ids.insert(wf_id.0.clone()) {
+            anyhow::bail!(
+                "duplicate workflow ID \"{}\": each WORKFLOW file must have a unique name",
+                wf_id
+            );
+        }
+
+        tracing::info!(workflow = %wf_id, path = %path.display(), "loaded workflow config");
+
+        // Capture port from first workflow config (unless CLI overrides)
+        if first_port.is_none() {
+            first_port = Some(config.server.port);
+        }
+
+        let (config_tx, config_rx) = tokio::sync::watch::channel(config);
+
+        let watcher = symposium::config::watch::spawn_watcher(path.clone(), config_tx)?;
+        watchers.push(watcher);
+
+        workflows.push(symposium::domain::workflow::WorkflowHandle {
+            id: wf_id,
+            config_rx,
+        });
+    }
 
     // CLI --port overrides config; config overrides default 8080
-    let port = cli.port.unwrap_or(config.server.port);
-    tracing::info!(workflow = %workflow_path.display(), port, "starting symposium");
+    let port = cli.port.unwrap_or(first_port.unwrap_or(8080));
+    tracing::info!(
+        workflows = workflows.len(),
+        port,
+        max_agents = ?cli.max_agents,
+        "starting symposium"
+    );
 
-    // Create config watch channel
-    let (config_tx, config_rx) = tokio::sync::watch::channel(config);
-
-    // Start config file watcher
-    let _watcher = symposium::config::watch::spawn_watcher(workflow_path, config_tx)?;
-
-    // Build shared orchestrator state
-    let state = symposium::domain::state::OrchestratorState::new(config_rx.clone());
+    // Build shared orchestrator state (config-agnostic)
+    let state = symposium::domain::state::OrchestratorState::new();
 
     // Build orchestrator and get event channel for server
-    let mut orchestrator = symposium::orchestrator::Orchestrator::new(state.clone(), config_rx);
+    let mut orchestrator =
+        symposium::orchestrator::Orchestrator::new(state.clone(), workflows, cli.max_agents);
     let event_tx = orchestrator.event_sender();
 
     // Start HTTP server in background
@@ -71,6 +111,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    // Keep watchers alive until shutdown
+    drop(watchers);
 
     Ok(())
 }

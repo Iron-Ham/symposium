@@ -4,6 +4,7 @@ use crate::config::schema::ServiceConfig;
 use crate::domain::issue::Issue;
 use crate::domain::retry::RetryEntry;
 use crate::domain::state::OrchestratorState;
+use crate::domain::workflow::{WorkflowHandle, WorkflowId};
 use crate::error::Result;
 use crate::prompt;
 use crate::tracker::notion::NotionTracker;
@@ -14,96 +15,153 @@ use crate::workspace::WorkspaceManager;
 
 use super::dispatch;
 use super::pr_review;
-use super::reconcile;
 use super::OrchestratorEvent;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
-/// Execute one poll-and-dispatch cycle.
-pub async fn run_tick(
+/// Execute one poll-and-dispatch cycle for a single workflow.
+pub async fn run_workflow_tick(
+    workflow: &WorkflowHandle,
     state: &OrchestratorState,
-    config_rx: &watch::Receiver<ServiceConfig>,
     event_tx: &mpsc::Sender<OrchestratorEvent>,
+    global_max_agents: Option<usize>,
 ) -> Result<()> {
-    let config = config_rx.borrow().clone();
+    let config = workflow.config_rx.borrow().clone();
+    let wf_id = &workflow.id;
 
-    // 1. Reconcile: check for stalled workers
-    reconcile::check_stalled(state, &config);
-
-    // 2. Dispatch ready retries
-    let ready_retries = state.take_ready_retries();
+    // 1. Dispatch ready retries for this workflow
+    let ready_retries = state.take_ready_retries_for_workflow(&wf_id.0);
     for retry in &ready_retries {
-        tracing::info!(issue_id = %retry.issue_id, attempt = retry.attempt, "retry ready");
+        tracing::info!(
+            state_key = %retry.issue_id,
+            workflow = %wf_id,
+            attempt = retry.attempt,
+            "retry ready"
+        );
     }
 
-    // 3. Check if we have capacity for new work
-    let running = state.running_count();
+    // 2. Check if we have capacity for new work
+    let running = state.running_count_for_workflow(&wf_id.0);
     let max = config.agent.max_concurrent_agents;
-    tracing::debug!(running, max, retries = ready_retries.len(), "tick");
+    tracing::debug!(
+        workflow = %wf_id,
+        running,
+        max,
+        retries = ready_retries.len(),
+        "tick"
+    );
 
-    if running >= max && ready_retries.is_empty() {
+    let at_workflow_capacity = running >= max;
+    let at_global_capacity = global_max_agents
+        .map(|g| state.running_count() >= g)
+        .unwrap_or(false);
+
+    if (at_workflow_capacity || at_global_capacity) && ready_retries.is_empty() {
         return Ok(());
     }
 
-    // 4. Connect to tracker and fetch candidates
-    let mut tracker = match NotionTracker::new(config.tracker.clone()).await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("failed to connect to tracker: {e}");
-            return Ok(());
-        }
-    };
+    // 3. Connect to Notion tracker and fetch candidates (skip if no active states)
+    let has_notion = !config.tracker.active_states.is_empty();
+    let mut tracker: Option<NotionTracker> = None;
+    let mut candidates: Vec<Issue> = Vec::new();
 
-    let mut candidates = match tracker.fetch_candidate_issues().await {
-        Ok(issues) => issues,
-        Err(e) => {
-            tracing::error!("failed to fetch candidates: {e}");
-            return Ok(());
-        }
-    };
+    if has_notion {
+        match NotionTracker::new(config.tracker.clone()).await {
+            Ok(t) => {
+                tracker = Some(t);
+            }
+            Err(e) => {
+                tracing::error!(workflow = %wf_id, "failed to connect to tracker: {e}");
+                return Ok(());
+            }
+        };
 
-    // 4b. Fetch from Sentry (if enabled)
+        match tracker.as_mut().unwrap().fetch_candidate_issues().await {
+            Ok(issues) => {
+                tracing::info!(
+                    workflow = %wf_id,
+                    database_id = %config.tracker.database_id,
+                    count = issues.len(),
+                    "fetched Notion candidates"
+                );
+                candidates = issues;
+            }
+            Err(e) => {
+                tracing::error!(workflow = %wf_id, "failed to fetch candidates: {e}");
+                return Ok(());
+            }
+        }
+
+        // Tag all candidates with the workflow ID
+        for issue in &mut candidates {
+            issue.workflow_id = wf_id.0.clone();
+        }
+    } else {
+        tracing::debug!(workflow = %wf_id, "skipping Notion tracker (no active_states)");
+    }
+
+    // 3b. Fetch from Sentry (if enabled)
+    let mut sentry_tracker: Option<SentryTracker> = None;
     if config.sentry.enabled {
         match SentryTracker::new(config.sentry.clone()).await {
             Ok(mut sentry) => match sentry.fetch_candidate_issues().await {
-                Ok(sentry_issues) => candidates.extend(sentry_issues),
-                Err(e) => tracing::error!("failed to fetch Sentry issues: {e}"),
+                Ok(mut sentry_issues) => {
+                    tracing::info!(
+                        workflow = %wf_id,
+                        project = %config.sentry.project,
+                        count = sentry_issues.len(),
+                        "fetched Sentry candidates"
+                    );
+                    for issue in &mut sentry_issues {
+                        issue.workflow_id = wf_id.0.clone();
+                    }
+                    candidates.extend(sentry_issues);
+                    sentry_tracker = Some(sentry);
+                }
+                Err(e) => tracing::error!(workflow = %wf_id, "failed to fetch Sentry issues: {e}"),
             },
-            Err(e) => tracing::error!("failed to create Sentry tracker: {e}"),
+            Err(e) => tracing::error!(workflow = %wf_id, "failed to create Sentry tracker: {e}"),
         }
     }
 
-    // 5. Sort by priority and filter eligible
+    // 4. Sort by priority and filter eligible
     dispatch::sort_candidates(&mut candidates);
 
-    // 6. Dispatch eligible issues (up to remaining capacity)
+    // 5. Dispatch eligible issues (up to remaining capacity)
     for issue in candidates {
-        if !dispatch::is_eligible(&issue, state, &config) {
+        if !dispatch::is_eligible(&issue, state, &config, wf_id, global_max_agents) {
             continue;
         }
 
-        dispatch_issue(issue, state, &config, config_rx, event_tx);
+        dispatch_issue(issue, state, &config, &workflow.config_rx, event_tx, wf_id);
     }
 
-    // 7. Re-dispatch ready retries
+    // 6. Re-dispatch ready retries
     for retry in ready_retries {
-        dispatch_retry(retry, state, &config, config_rx, event_tx);
+        dispatch_retry(retry, state, &config, &workflow.config_rx, event_tx, wf_id);
     }
 
-    // 8. Clean up workspaces for terminal issues
-    cleanup_terminal(&mut tracker, state, config_rx).await;
-
-    // 8b. Clean up Sentry terminal issues
-    if config.sentry.enabled {
-        match SentryTracker::new(config.sentry.clone()).await {
-            Ok(mut sentry) => cleanup_terminal_sentry(&mut sentry, state, config_rx).await,
-            Err(e) => tracing::debug!("failed to create Sentry tracker for cleanup: {e}"),
-        }
+    // 7. Clean up workspaces for terminal issues (only if Notion tracker is active)
+    if let Some(ref mut t) = tracker {
+        cleanup_terminal(t, state, &workflow.config_rx, wf_id).await;
     }
 
-    // 9. Check open PRs for review feedback
+    // 7b. Clean up Sentry terminal issues (reuse the tracker from step 3b)
+    if let Some(ref mut sentry) = sentry_tracker {
+        cleanup_terminal_sentry(sentry, state, &workflow.config_rx, wf_id).await;
+    }
+
+    // 8. Check open PRs for review feedback
     if config.pr_review.enabled {
-        pr_review::check_and_dispatch_pr_reviews(state, &config, config_rx, event_tx).await;
+        pr_review::check_and_dispatch_pr_reviews(
+            state,
+            &config,
+            &workflow.config_rx,
+            event_tx,
+            wf_id,
+            global_max_agents,
+        )
+        .await;
     }
 
     Ok(())
@@ -116,19 +174,24 @@ fn dispatch_issue(
     config: &ServiceConfig,
     config_rx: &watch::Receiver<ServiceConfig>,
     event_tx: &mpsc::Sender<OrchestratorEvent>,
+    workflow_id: &WorkflowId,
 ) {
-    let issue_id = issue.identifier.clone();
-    tracing::info!(issue_id, "dispatching worker");
+    let state_key = workflow_id.state_key(&issue.identifier);
+    tracing::info!(state_key, workflow = %workflow_id, "dispatching worker");
 
-    state.start_session(issue.clone());
+    let stall_timeout = config.codex.stall_timeout();
+    state.start_session(&state_key, issue.clone(), stall_timeout, &workflow_id.0);
 
     let config = config.clone();
     let config_rx = config_rx.clone();
     let event_tx = event_tx.clone();
+    let wf_id = workflow_id.clone();
+    let state_key_clone = state_key.clone();
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        let result = run_worker(&issue, &config, &config_rx, None, &state_clone).await;
+        let result =
+            run_worker(&issue, &config, &config_rx, None, &state_clone, &state_key_clone).await;
 
         let (success, error) = match &result {
             Ok(true) => (true, None),
@@ -136,20 +199,30 @@ fn dispatch_issue(
             Err(e) => (false, Some(e.to_string())),
         };
 
-        let _ = event_tx
+        if let Err(e) = event_tx
             .send(OrchestratorEvent::WorkerCompleted {
-                issue_id: issue.identifier.clone(),
+                state_key: state_key_clone.clone(),
                 success,
                 error: error.clone(),
             })
-            .await;
+            .await
+        {
+            tracing::error!(state_key = %state_key_clone, "failed to send WorkerCompleted event: {e}");
+        }
 
         // Schedule retry on failure
         if !success {
             let base = Duration::from_secs(1);
             let max = Duration::from_secs(300);
             let delay = super::retry::calculate_backoff(0, base, max);
-            super::retry::schedule_retry(issue.identifier, 1, delay, event_tx);
+            state_clone.schedule_retry(&state_key_clone, 1, &wf_id.0);
+            super::retry::schedule_retry(
+                state_key_clone,
+                1,
+                delay,
+                wf_id.0,
+                event_tx,
+            );
         }
     });
 }
@@ -161,29 +234,52 @@ fn dispatch_retry(
     config: &ServiceConfig,
     config_rx: &watch::Receiver<ServiceConfig>,
     event_tx: &mpsc::Sender<OrchestratorEvent>,
+    workflow_id: &WorkflowId,
 ) {
-    let issue_id = retry.issue_id.clone();
+    let state_key = retry.issue_id.clone();
 
     // Guard: don't dispatch a retry if the issue is still running (e.g. stale retry entry)
-    if state.is_running(&issue_id) {
-        tracing::warn!(issue_id, "skipping retry — session still running");
+    if state.is_running(&state_key) {
+        tracing::warn!(state_key, "skipping retry — session still running");
         return;
     }
 
-    tracing::info!(issue_id, attempt = retry.attempt, "dispatching retry");
+    tracing::info!(state_key, workflow = %workflow_id, attempt = retry.attempt, "dispatching retry");
 
     let config = config.clone();
     let config_rx = config_rx.clone();
     let event_tx = event_tx.clone();
     let state_clone = state.clone();
     let attempt = retry.attempt;
+    let wf_id = workflow_id.clone();
+    let stall_timeout = config.codex.stall_timeout();
 
     tokio::spawn(async move {
-        let Some(issue) = fetch_issue_for_retry(&issue_id, &config).await else {
+        // Extract the issue_id from the state_key (strip workflow prefix)
+        let issue_id = state_key
+            .split_once('/')
+            .map(|(_, id)| id)
+            .unwrap_or(&state_key);
+
+        let Some(mut issue) = fetch_issue_for_retry(issue_id, &config).await else {
+            tracing::error!(
+                state_key,
+                attempt,
+                "retry abandoned — issue could not be fetched from tracker"
+            );
             return;
         };
 
-        let result = run_worker(&issue, &config, &config_rx, Some(attempt), &state_clone).await;
+        // Tag the re-fetched issue with the current workflow ID so that
+        // downstream consumers (e.g. track_created_pr) see the correct workflow.
+        issue.workflow_id = wf_id.0.clone();
+
+        // Register the retry session
+        state_clone.start_session(&state_key, issue.clone(), stall_timeout, &wf_id.0);
+
+        let result =
+            run_worker(&issue, &config, &config_rx, Some(attempt), &state_clone, &state_key)
+                .await;
 
         let (success, error) = match &result {
             Ok(true) => (true, None),
@@ -191,20 +287,30 @@ fn dispatch_retry(
             Err(e) => (false, Some(e.to_string())),
         };
 
-        let _ = event_tx
+        if let Err(e) = event_tx
             .send(OrchestratorEvent::WorkerCompleted {
-                issue_id: issue.identifier.clone(),
+                state_key: state_key.clone(),
                 success,
                 error: error.clone(),
             })
-            .await;
+            .await
+        {
+            tracing::error!(state_key, "failed to send WorkerCompleted event: {e}");
+        }
 
         // Schedule further retry on failure, with increasing backoff
         if !success {
             let base = Duration::from_secs(1);
             let max = Duration::from_secs(300);
             let delay = super::retry::calculate_backoff(attempt, base, max);
-            super::retry::schedule_retry(issue.identifier, attempt + 1, delay, event_tx);
+            state_clone.schedule_retry(&state_key, attempt + 1, &wf_id.0);
+            super::retry::schedule_retry(
+                state_key,
+                attempt + 1,
+                delay,
+                wf_id.0,
+                event_tx,
+            );
         }
     });
 }
@@ -212,7 +318,10 @@ fn dispatch_retry(
 /// Re-fetch a single issue from the correct tracker for retry dispatch.
 /// Returns `None` and logs errors if the issue cannot be fetched.
 async fn fetch_issue_for_retry(issue_id: &str, config: &ServiceConfig) -> Option<Issue> {
-    if issue_id.starts_with("sentry:") {
+    let is_sentry = config.sentry.enabled
+        && !config.sentry.id_prefix.is_empty()
+        && issue_id.starts_with(&config.sentry.id_prefix);
+    if is_sentry {
         let mut tracker = match SentryTracker::new(config.sentry.clone()).await {
             Ok(t) => t,
             Err(e) => {
@@ -270,6 +379,7 @@ async fn run_worker(
     config_rx: &watch::Receiver<ServiceConfig>,
     attempt: Option<u32>,
     state: &OrchestratorState,
+    state_key: &str,
 ) -> Result<bool> {
     use crate::domain::session::{AgentEvent, AgentEventKind, RunStatus};
     use crate::workspace::hooks;
@@ -309,7 +419,7 @@ async fn run_worker(
 
     // Ensure workspace exists (creates + runs after_create hook if new)
     state.push_agent_event(
-        &issue.identifier,
+        state_key,
         AgentEvent::now(AgentEventKind::Status {
             status: "Setting up workspace".into(),
         }),
@@ -326,11 +436,13 @@ async fn run_worker(
                 issue_id = issue.identifier,
                 "preflight is enabled but prompt_template is empty — skipping preflight"
             );
-        } else if let Ok(mut preflight_prompt) =
-            prompt::build_prompt(&config.preflight.prompt_template, &issue, attempt)
-        {
+        } else if let Ok(mut preflight_prompt) = prompt::build_prompt(
+            &config.preflight.prompt_template,
+            &issue,
+            attempt,
+        ) {
             state.push_agent_event(
-                &issue.identifier,
+                state_key,
                 AgentEvent::now(AgentEventKind::Status {
                     status: "Running preflight check".into(),
                 }),
@@ -354,7 +466,7 @@ async fn run_worker(
                         &mut preflight_worker,
                         &preflight_prompt,
                         state,
-                        &issue.identifier,
+                        state_key,
                     )
                     .await
                     {
@@ -365,7 +477,7 @@ async fn run_worker(
                                 "preflight agent failed: {e} — proceeding to main agent"
                             );
                             state.push_agent_event(
-                                &issue.identifier,
+                                state_key,
                                 AgentEvent::now(AgentEventKind::Error {
                                     message: format!("Preflight agent failed: {e}"),
                                 }),
@@ -379,7 +491,7 @@ async fn run_worker(
                         "failed to start preflight agent: {e} — proceeding to main agent"
                     );
                     state.push_agent_event(
-                        &issue.identifier,
+                        state_key,
                         AgentEvent::now(AgentEventKind::Error {
                             message: format!("Failed to start preflight agent: {e}"),
                         }),
@@ -407,7 +519,7 @@ async fn run_worker(
                 }
 
                 state.push_agent_event(
-                    &issue.identifier,
+                    state_key,
                     AgentEvent::now(AgentEventKind::Status {
                         status: format!(
                             "Preflight: skipped — {}",
@@ -423,9 +535,12 @@ async fn run_worker(
                 ws.finish(&issue, true).await?;
                 return Ok(true);
             }
-        } else {
+        } else if let Err(e) =
+            prompt::build_prompt(&config.preflight.prompt_template, &issue, attempt)
+        {
             tracing::warn!(
                 issue_id = issue.identifier,
+                error = %e,
                 "failed to render preflight prompt template — skipping preflight"
             );
         }
@@ -439,12 +554,12 @@ async fn run_worker(
 
     // Start agent session
     state.push_agent_event(
-        &issue.identifier,
+        state_key,
         AgentEvent::now(AgentEventKind::Status {
             status: "Starting agent".into(),
         }),
     );
-    state.update_session_status(&issue.identifier, RunStatus::Running);
+    state.update_session_status(state_key, RunStatus::Running);
 
     // Use agent_subdirectory if configured (e.g. "mail-ios" within the repo worktree)
     let agent_dir = match &config.workspace.agent_subdirectory {
@@ -459,7 +574,7 @@ async fn run_worker(
 
     // Run multi-turn agent loop
     let success =
-        run_agent_attempt(&mut worker, &prompt_text, state, &issue.identifier).await?;
+        run_agent_attempt(&mut worker, &prompt_text, state, state_key).await?;
 
     if success {
         // Post-completion pipeline: commit → review → PR
@@ -468,7 +583,7 @@ async fn run_worker(
         // 1. Run review agent (if enabled)
         if config.review.enabled {
             state.push_agent_event(
-                &issue.identifier,
+                state_key,
                 AgentEvent::now(AgentEventKind::Status {
                     status: "Running deep review".into(),
                 }),
@@ -496,7 +611,7 @@ async fn run_worker(
             let mut review_prompt = build_review_prompt(&issue, &config.review.prompt_template);
             // Ask the reviewer to update the PR metadata the implementer wrote,
             // accounting for any changes the review introduced.
-            review_prompt.push_str(&pr_metadata_update_instructions());
+            review_prompt.push_str(pr_metadata_update_instructions());
             match runner
                 .start_session(&agent_dir, &review_prompt, &issue.identifier)
                 .await
@@ -506,7 +621,7 @@ async fn run_worker(
                         &mut review_worker,
                         &review_prompt,
                         state,
-                        &issue.identifier,
+                        state_key,
                     )
                     .await
                     {
@@ -530,7 +645,7 @@ async fn run_worker(
 
         // 3. Push branch and open draft PR
         state.push_agent_event(
-            &issue.identifier,
+            state_key,
             AgentEvent::now(AgentEventKind::Status {
                 status: "Opening draft PR".into(),
             }),
@@ -544,8 +659,12 @@ async fn run_worker(
         let tmp = std::env::temp_dir();
         let title_file = tmp.join(format!("symposium-pr-title-{}", issue.identifier));
         let body_file = tmp.join(format!("symposium-pr-body-{}", issue.identifier));
-        let _ = tokio::fs::write(&title_file, &pr_title).await;
-        let _ = tokio::fs::write(&body_file, &pr_body_text).await;
+        if let Err(e) = tokio::fs::write(&title_file, &pr_title).await {
+            tracing::warn!(path = %title_file.display(), "failed to write PR title temp file: {e}");
+        }
+        if let Err(e) = tokio::fs::write(&body_file, &pr_body_text).await {
+            tracing::warn!(path = %body_file.display(), "failed to write PR body temp file: {e}");
+        }
         let pr_script = format!(
             "git push -u origin HEAD 2>&1 && gh pr create --draft --title \"$(cat {})\" --body-file {} 2>&1",
             title_file.display(),
@@ -555,7 +674,7 @@ async fn run_worker(
             Ok(()) => {
                 tracing::info!(issue_id = issue.identifier, "draft PR created");
                 state.push_agent_event(
-                    &issue.identifier,
+                    state_key,
                     AgentEvent::now(AgentEventKind::Status {
                         status: "Draft PR opened".into(),
                     }),
@@ -563,13 +682,21 @@ async fn run_worker(
 
                 // Track PR for review monitoring
                 if config.pr_review.enabled {
-                    track_created_pr(&issue, &workspace_dir, state, hook_timeout).await;
+                    track_created_pr(
+                        &issue,
+                        &workspace_dir,
+                        state,
+                        state_key,
+                        &issue.workflow_id,
+                        hook_timeout,
+                    )
+                    .await;
                 }
             }
             Err(e) => {
                 tracing::warn!(issue_id = issue.identifier, "PR creation failed: {e}");
                 state.push_agent_event(
-                    &issue.identifier,
+                    state_key,
                     AgentEvent::now(AgentEventKind::Error {
                         message: format!("PR creation failed: {e}"),
                     }),
@@ -602,7 +729,11 @@ async fn read_pr_metadata(workspace_dir: &std::path::Path, issue: &Issue) -> (St
             let title = contents.trim().to_string();
             if title.is_empty() { default_pr_title(issue) } else { title }
         }
-        Err(_) => default_pr_title(issue),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => default_pr_title(issue),
+        Err(e) => {
+            tracing::warn!(path = %title_path.display(), "failed to read PR_TITLE: {e}");
+            default_pr_title(issue)
+        }
     };
 
     let pr_body = match tokio::fs::read_to_string(&body_path).await {
@@ -611,7 +742,11 @@ async fn read_pr_metadata(workspace_dir: &std::path::Path, issue: &Issue) -> (St
             let body = contents.trim().to_string();
             if body.is_empty() { default_pr_body(issue) } else { body }
         }
-        Err(_) => default_pr_body(issue),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => default_pr_body(issue),
+        Err(e) => {
+            tracing::warn!(path = %body_path.display(), "failed to read PR_BODY.md: {e}");
+            default_pr_body(issue)
+        }
     };
 
     (pr_title, pr_body)
@@ -709,11 +844,10 @@ These files must NOT be git-committed — just write them to disk."#,
 ///
 /// The reviewer may have made additional changes, so it updates the existing
 /// PR metadata the implementer wrote to reflect the final state of the branch.
-fn pr_metadata_update_instructions() -> String {
+fn pr_metadata_update_instructions() -> &'static str {
     r#"
 
 Finally, read the `PR_TITLE` and `PR_BODY.md` files in the root of the git repository. These were written by the implementer. If you made any changes during your review, update these files to reflect the final state of the branch. If you made no changes, leave them as-is. Do NOT git-commit these files."#
-        .to_string()
 }
 
 
@@ -725,6 +859,7 @@ fn remove_terminal_workspaces(
     terminal_issues: Vec<Issue>,
     state: &OrchestratorState,
     config_rx: &watch::Receiver<ServiceConfig>,
+    workflow_id: &WorkflowId,
 ) {
     let ws = WorkspaceManager::new(config_rx.clone());
     let tracked_pr_ids: std::collections::HashSet<String> = state
@@ -733,6 +868,7 @@ fn remove_terminal_workspaces(
         .map(|pr| pr.issue.identifier.clone())
         .collect();
     let state = state.clone();
+    let wf_id = workflow_id.clone();
     tokio::spawn(async move {
         for issue in terminal_issues {
             if tracked_pr_ids.contains(&issue.identifier) {
@@ -742,7 +878,8 @@ fn remove_terminal_workspaces(
                 );
                 continue;
             }
-            if !state.is_running(&issue.identifier)
+            let sk = wf_id.state_key(&issue.identifier);
+            if !state.is_running(&sk)
                 && let Err(e) = ws.remove(&issue.identifier).await
             {
                 tracing::warn!(
@@ -759,10 +896,11 @@ async fn cleanup_terminal(
     tracker: &mut NotionTracker,
     state: &OrchestratorState,
     config_rx: &watch::Receiver<ServiceConfig>,
+    workflow_id: &WorkflowId,
 ) {
     match tracker.fetch_terminal_issues().await {
-        Ok(issues) => remove_terminal_workspaces(issues, state, config_rx),
-        Err(e) => tracing::debug!("failed to fetch terminal issues for cleanup: {e}"),
+        Ok(issues) => remove_terminal_workspaces(issues, state, config_rx, workflow_id),
+        Err(e) => tracing::warn!(workflow = %workflow_id, "failed to fetch terminal issues for cleanup: {e}"),
     }
 }
 
@@ -771,6 +909,8 @@ async fn track_created_pr(
     issue: &Issue,
     workspace_dir: &std::path::Path,
     state: &OrchestratorState,
+    state_key: &str,
+    workflow_id: &str,
     timeout: Duration,
 ) {
     let script = "gh pr view --json number";
@@ -779,7 +919,13 @@ async fn track_created_pr(
             match serde_json::from_str::<serde_json::Value>(output.trim()) {
                 Ok(data) => {
                     if let Some(number) = data["number"].as_u64() {
-                        state.track_pr(issue.clone(), number, workspace_dir.to_path_buf());
+                        state.track_pr(
+                            state_key,
+                            issue.clone(),
+                            number,
+                            workspace_dir.to_path_buf(),
+                            workflow_id,
+                        );
                         tracing::info!(
                             issue_id = issue.identifier,
                             pr = number,
@@ -815,9 +961,10 @@ async fn cleanup_terminal_sentry(
     tracker: &mut SentryTracker,
     state: &OrchestratorState,
     config_rx: &watch::Receiver<ServiceConfig>,
+    workflow_id: &WorkflowId,
 ) {
     match tracker.fetch_terminal_issues().await {
-        Ok(issues) => remove_terminal_workspaces(issues, state, config_rx),
-        Err(e) => tracing::debug!("failed to fetch terminal Sentry issues for cleanup: {e}"),
+        Ok(issues) => remove_terminal_workspaces(issues, state, config_rx, workflow_id),
+        Err(e) => tracing::warn!(workflow = %workflow_id, "failed to fetch terminal Sentry issues for cleanup: {e}"),
     }
 }

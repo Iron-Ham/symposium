@@ -3,3 +3,4 @@
 # Workflow files may contain sensitive configuration
 WORKFLOW.*.md
 !WORKFLOW.example.md
+!WORKFLOW.example2.md

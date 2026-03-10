@@ -1,7 +1,31 @@
 # Symposium Workflow Configuration
 
 Copy this file to `WORKFLOW.<name>.md` and fill in your values.
-Files matching `WORKFLOW.*.md` (except this example) are gitignored.
+Files matching `WORKFLOW.*.md` (except examples) are gitignored.
+
+## Multi-Workflow Support
+
+Symposium supports running multiple workflows simultaneously from a single process.
+Each workflow file gets its own tracker, config, polling interval, and workspace root.
+
+```sh
+# Single workflow (backward compatible)
+symposium WORKFLOW.md
+
+# Multiple workflows
+symposium WORKFLOW.bugs.md WORKFLOW.sentry.md WORKFLOW.tasks.md
+
+# With a global agent cap across all workflows
+symposium WORKFLOW.bugs.md WORKFLOW.tasks.md --max-agents 4
+```
+
+The workflow ID is derived from the filename: `WORKFLOW.bugs.md` becomes `"bugs"`,
+`WORKFLOW.md` becomes `"default"`. Each workflow's issues are namespaced in state
+so the same issue ID in two different workflows won't collide.
+
+Concurrency is enforced per-workflow (each workflow's `max_concurrent_agents`) plus
+an optional global cap (`--max-agents`). Without a global cap, workflows run
+independently.
 
 ---
 
@@ -30,6 +54,9 @@ tracker:
   # assignee_user_id: "your-notion-user-uuid"
   # Optional: skip issues where this relation property is non-null (e.g. linked PRs)
   # skip_if_set: "GitHub Pull Requests"
+  # Optional: prefix prepended to the raw ID value (e.g. "BUG-" -> "BUG-316205")
+  # Affects issue identifiers everywhere: state keys, branch names, PR titles.
+  # id_prefix: "BUG-"
 
 polling:
   interval_ms: 30000
@@ -57,7 +84,7 @@ agent:
 codex:
   command: "/usr/local/bin/claude"
   turn_timeout_ms: 3600000    # 1 hour max per agent session
-  stall_timeout_ms: 300000    # 5 min with no activity → stalled
+  stall_timeout_ms: 300000    # 5 min with no activity -> stalled
 
 server:
   port: 8080
@@ -67,7 +94,7 @@ server:
 # Useful for giving agents access to Sentry, Datadog, PagerDuty, etc.
 # mcp_servers:
 #   sentry:
-#     type: http
+#     type: url  # "url" for HTTP MCP servers, "stdio" for command-based
 #     url: "https://mcp.sentry.dev/mcp"
 #   custom-linter:
 #     type: stdio
@@ -86,11 +113,12 @@ server:
 #   mcp_url: "https://mcp.sentry.dev/mcp"  # Sentry MCP server (OAuth auth)
 #   query: "release:[my-app@1.7.*,my-app@1.8.*]"  # Sentry search syntax
 #   min_events: 5                           # skip issues below this threshold
+#   id_prefix: "SENTRY:"                    # default: "sentry:" — prefix for Sentry issue IDs
 
 # Optional: run a pre-flight verification step before the main agent.
 # When enabled, a separate agent session runs first to verify the issue is
 # still valid (e.g. reproduce the bug, check if already fixed). If the agent
-# writes a PREFLIGHT_SKIP file, the issue is skipped entirely — no
+# writes a PREFLIGHT_SKIP file, the issue is skipped entirely -- no
 # implementation, review, or PR is created.
 # preflight:
 #   enabled: true
@@ -141,16 +169,16 @@ Everything after the YAML front matter closing `---` is a Liquid template.
 It is rendered per-issue and sent to the agent as its initial prompt via stdin.
 
 Available variables:
-- `{{ issue.identifier }}` — issue ID (e.g. "316205" or "sentry:MAIL-IOS-3B")
-- `{{ issue.safe_identifier }}` — branch-safe version of the ID (colons → hyphens)
-- `{{ issue.title }}` — issue title
-- `{{ issue.description }}` — issue description/notes
-- `{{ issue.status }}` — current status
-- `{{ issue.priority }}` — priority level
-- `{{ issue.url }}` — link to the issue page
-- `{{ issue.comments }}` — formatted page comments (author + timestamp + body)
-- `{{ issue.<property> }}` — any extra Notion property (lowercased column name)
-- `{{ attempt }}` — retry attempt number (nil on first run)
+- `{{ issue.identifier }}` -- issue ID (e.g. "316205" or "sentry:MAIL-IOS-3B")
+- `{{ issue.safe_identifier }}` -- branch-safe version of the ID (colons -> hyphens)
+- `{{ issue.title }}` -- issue title
+- `{{ issue.description }}` -- issue description/notes
+- `{{ issue.status }}` -- current status
+- `{{ issue.priority }}` -- priority level
+- `{{ issue.url }}` -- link to the issue page
+- `{{ issue.comments }}` -- formatted page comments (author + timestamp + body)
+- `{{ issue.<property> }}` -- any extra Notion property (lowercased column name)
+- `{{ attempt }}` -- retry attempt number (nil on first run)
 
 ```liquid
 You are working on bug {{ issue.identifier }}: {{ issue.title }}.
@@ -181,7 +209,7 @@ When `preflight.enabled` is set to `true`, Symposium runs a separate agent sessi
 useful for bug workflows where issues may become stale, get fixed by other changes, or
 turn out to be expected behavior.
 
-The preflight agent runs with full access to the workspace, MCP servers, and tools —
+The preflight agent runs with full access to the workspace, MCP servers, and tools --
 just like the main agent. Its prompt is a Liquid template with all the same variables
 (`{{ issue.identifier }}`, `{{ issue.title }}`, `{{ issue.description }}`, etc.).
 
@@ -217,9 +245,9 @@ preflight:
 
 Symposium automatically instructs agents to write PR metadata files in the workspace root:
 
-- **`PR_TITLE`** — A single line with the PR title. Should be a concise, human-readable
+- **`PR_TITLE`** -- A single line with the PR title. Should be a concise, human-readable
   summary of the actual change (not just the bug title). No conventional commit prefixes.
-- **`PR_BODY.md`** — Markdown PR body including investigation reasoning, what was changed
+- **`PR_BODY.md`** -- Markdown PR body including investigation reasoning, what was changed
   and why, and a link back to the issue (e.g. `Fixes 316205`).
 
 The **implementer agent** writes these files after committing its fix, since it has the
@@ -229,14 +257,14 @@ then updates them if it made any additional changes.
 If the files are missing, Symposium falls back to a generic title/body based on the
 issue ID and title.
 
-These files are **not** committed to git — they are read from disk and then cleaned up.
+These files are **not** committed to git -- they are read from disk and then cleaned up.
 
 ## PR Review Monitoring
 
 When `pr_review.enabled` is set to `true`, Symposium monitors open PRs it created for
 reviewer feedback. Each tick, it runs `gh pr view` to check for new comments or change
 requests. If actionable feedback is detected, it spins up an agent in the **existing
-workspace** to address the feedback — no new workspace or branch is created.
+workspace** to address the feedback -- no new workspace or branch is created.
 
 Reviews are grouped per-author, and only the latest review state per author is considered.
 This means if a reviewer requests changes and later approves, the approval supersedes the
