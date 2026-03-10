@@ -212,4 +212,65 @@ Prompt here."#;
         assert!(!config.sentry.enabled);
         assert_eq!(config.tracker.kind, "notion");
     }
+
+    #[test]
+    fn parse_pr_review_config_defaults() {
+        let content = "---\n---\nPrompt here.";
+        let (config, _) = parse_workflow(content).unwrap();
+        assert!(!config.pr_review.enabled);
+        assert!(config.pr_review.prompt_template.is_empty());
+        assert!(matches!(
+            config.pr_review.reviewers,
+            crate::config::schema::ReviewerFilter::All
+        ));
+    }
+
+    #[test]
+    fn parse_pr_review_config_enabled() {
+        let content = r#"---
+pr_review:
+  enabled: true
+  reviewers: humans
+---
+Prompt here."#;
+        let (config, _) = parse_workflow(content).unwrap();
+        assert!(config.pr_review.enabled);
+        assert!(matches!(
+            config.pr_review.reviewers,
+            crate::config::schema::ReviewerFilter::Humans
+        ));
+    }
+
+    #[test]
+    fn parse_pr_review_config_specific_reviewers() {
+        let content = r#"---
+pr_review:
+  enabled: true
+  reviewers:
+    - alice
+    - bob
+---
+Prompt here."#;
+        let (config, _) = parse_workflow(content).unwrap();
+        assert!(config.pr_review.enabled);
+        match &config.pr_review.reviewers {
+            crate::config::schema::ReviewerFilter::Specific(names) => {
+                assert_eq!(names, &["alice", "bob"]);
+            }
+            other => panic!("expected Specific, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_pr_review_config_with_template() {
+        let content = r#"---
+pr_review:
+  enabled: true
+  prompt_template: "Fix PR #{{ issue.pr_number }} for {{ issue.identifier }}."
+---
+Prompt here."#;
+        let (config, _) = parse_workflow(content).unwrap();
+        assert!(config.pr_review.enabled);
+        assert!(config.pr_review.prompt_template.contains("{{ issue.pr_number }}"));
+    }
 }

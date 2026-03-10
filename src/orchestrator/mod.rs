@@ -1,4 +1,5 @@
 pub mod dispatch;
+pub mod pr_review;
 pub mod reconcile;
 pub mod retry;
 pub mod tick;

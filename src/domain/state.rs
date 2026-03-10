@@ -5,6 +5,7 @@ use crate::config::schema::ServiceConfig;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
@@ -22,6 +23,16 @@ struct StateInner {
     retries: HashMap<String, RetryEntry>,
     completed: Vec<CompletedEntry>,
     tokens: TokenTotals,
+    open_prs: HashMap<String, OpenPr>,
+}
+
+/// A PR opened by Symposium that is being monitored for review feedback.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenPr {
+    pub issue: Issue,
+    pub pr_number: u64,
+    pub workspace_dir: PathBuf,
+    pub last_addressed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,6 +62,7 @@ pub struct StateSnapshot {
     pub retries: Vec<String>,
     pub completed: Vec<CompletedEntry>,
     pub tokens: TokenTotals,
+    pub open_prs: Vec<OpenPr>,
 }
 
 impl OrchestratorState {
@@ -61,6 +73,7 @@ impl OrchestratorState {
                 retries: HashMap::new(),
                 completed: Vec::new(),
                 tokens: TokenTotals::default(),
+                open_prs: HashMap::new(),
             })),
             config_rx,
         }
@@ -173,6 +186,39 @@ impl OrchestratorState {
     }
 
 
+    pub fn track_pr(&self, issue: Issue, pr_number: u64, workspace_dir: PathBuf) {
+        let issue_id = issue.identifier.clone();
+        self.inner.lock().unwrap().open_prs.insert(
+            issue_id,
+            OpenPr {
+                issue,
+                pr_number,
+                workspace_dir,
+                last_addressed_at: None,
+            },
+        );
+    }
+
+    pub fn untrack_pr(&self, issue_id: &str) {
+        self.inner.lock().unwrap().open_prs.remove(issue_id);
+    }
+
+    pub fn open_prs(&self) -> Vec<OpenPr> {
+        self.inner
+            .lock()
+            .unwrap()
+            .open_prs
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn mark_pr_addressed(&self, issue_id: &str) {
+        if let Some(pr) = self.inner.lock().unwrap().open_prs.get_mut(issue_id) {
+            pr.last_addressed_at = Some(Utc::now());
+        }
+    }
+
     pub fn snapshot(&self) -> StateSnapshot {
         let inner = self.inner.lock().unwrap();
         StateSnapshot {
@@ -180,6 +226,7 @@ impl OrchestratorState {
             retries: inner.retries.keys().cloned().collect(),
             completed: inner.completed.clone(),
             tokens: inner.tokens.clone(),
+            open_prs: inner.open_prs.values().cloned().collect(),
         }
     }
 

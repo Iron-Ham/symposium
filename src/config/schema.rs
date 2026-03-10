@@ -14,6 +14,7 @@ pub struct ServiceConfig {
     pub codex: CodexConfig,
     pub server: ServerConfig,
     pub review: ReviewConfig,
+    pub pr_review: PrReviewConfig,
     pub mcp_servers: HashMap<String, McpServerConfig>,
     pub sentry: SentryConfig,
     pub prompt_template: String,
@@ -250,6 +251,79 @@ impl Default for ReviewConfig {
             enabled: true,
             prompt_template: String::new(),
             before_review: None,
+        }
+    }
+}
+
+/// Which reviewers' feedback should trigger a fix agent.
+#[derive(Debug, Clone, Default)]
+pub enum ReviewerFilter {
+    /// React to any reviewer's changes-requested.
+    #[default]
+    All,
+    /// Skip bot accounts (GitHub usernames ending in `[bot]`).
+    Humans,
+    /// Only react to these specific GitHub usernames.
+    Specific(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for ReviewerFilter {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FilterVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for FilterVisitor {
+            type Value = ReviewerFilter;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(r#""all", "humans", or a list of GitHub usernames"#)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<ReviewerFilter, E> {
+                match v {
+                    "all" => Ok(ReviewerFilter::All),
+                    "humans" => Ok(ReviewerFilter::Humans),
+                    other => Err(E::custom(format!(
+                        "unknown reviewer filter: \"{other}\", expected \"all\", \"humans\", or a list"
+                    ))),
+                }
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<ReviewerFilter, A::Error> {
+                let mut names = Vec::new();
+                while let Some(name) = seq.next_element::<String>()? {
+                    names.push(name);
+                }
+                Ok(ReviewerFilter::Specific(names))
+            }
+        }
+
+        deserializer.deserialize_any(FilterVisitor)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PrReviewConfig {
+    /// Whether to monitor open PRs for review feedback. Defaults to false.
+    pub enabled: bool,
+    /// Liquid template for the PR review response prompt. If empty, uses the built-in default.
+    pub prompt_template: String,
+    /// Which reviewers to respond to: "all", "humans", or a list of GitHub usernames.
+    pub reviewers: ReviewerFilter,
+}
+
+impl Default for PrReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prompt_template: String::new(),
+            reviewers: ReviewerFilter::All,
         }
     }
 }
