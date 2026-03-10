@@ -87,6 +87,19 @@ server:
 #   query: "release:[my-app@1.7.*,my-app@1.8.*]"  # Sentry search syntax
 #   min_events: 5                           # skip issues below this threshold
 
+# Optional: run a pre-flight verification step before the main agent.
+# When enabled, a separate agent session runs first to verify the issue is
+# still valid (e.g. reproduce the bug, check if already fixed). If the agent
+# writes a PREFLIGHT_SKIP file, the issue is skipped entirely — no
+# implementation, review, or PR is created.
+# preflight:
+#   enabled: true
+#   prompt_template: |
+#     You are verifying bug {{ issue.identifier }}: {{ issue.title }}.
+#     {{ issue.description }}
+#     Walk through the code and confirm this bug is real and reproducible.
+#     If the bug involves UI behavior, build a preview and test it.
+
 # Optional: configure the post-completion review step
 review:
   # Set to false to skip the review step entirely (default: true)
@@ -134,6 +147,9 @@ Available variables:
 - `{{ issue.description }}` — issue description/notes
 - `{{ issue.status }}` — current status
 - `{{ issue.priority }}` — priority level
+- `{{ issue.url }}` — link to the issue page
+- `{{ issue.comments }}` — formatted page comments (author + timestamp + body)
+- `{{ issue.<property> }}` — any extra Notion property (lowercased column name)
 - `{{ attempt }}` — retry attempt number (nil on first run)
 
 ```liquid
@@ -156,6 +172,45 @@ This is a bug fix. Focus on:
 {% if attempt %}
 This is retry attempt {{ attempt }}. Review what happened in the previous attempt and continue from where you left off.
 {% endif %}
+```
+
+## Pre-flight Verification
+
+When `preflight.enabled` is set to `true`, Symposium runs a separate agent session
+**before** the main implementer to verify the issue is still valid. This is especially
+useful for bug workflows where issues may become stale, get fixed by other changes, or
+turn out to be expected behavior.
+
+The preflight agent runs with full access to the workspace, MCP servers, and tools —
+just like the main agent. Its prompt is a Liquid template with all the same variables
+(`{{ issue.identifier }}`, `{{ issue.title }}`, `{{ issue.description }}`, etc.).
+
+### Skip signal
+
+If the preflight agent determines the issue should be skipped, it writes a
+`PREFLIGHT_SKIP` file in its working directory containing a brief explanation.
+Symposium reads this file and short-circuits: no implementation, no review, no PR.
+The issue is marked as handled and will not be retried.
+
+If the file is not written, execution proceeds to the main agent automatically.
+
+### Fail-open design
+
+If the preflight agent fails to start or errors during execution, Symposium logs a
+warning and proceeds to the main agent. A broken preflight never blocks real work.
+Similarly, if the `prompt_template` has a Liquid syntax error, the preflight is
+skipped with a warning.
+
+### Example: bug verification
+
+```yaml
+preflight:
+  enabled: true
+  prompt_template: |
+    You are verifying bug {{ issue.identifier }}: {{ issue.title }}.
+    {{ issue.description }}
+    Walk through the relevant code paths and confirm the bug exists.
+    If you can reproduce it via tests or a build, do so.
 ```
 
 ## PR Metadata
