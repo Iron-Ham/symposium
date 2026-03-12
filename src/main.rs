@@ -85,6 +85,10 @@ async fn main() -> anyhow::Result<()> {
         .join(".symposium");
     let state = symposium::domain::state::OrchestratorState::with_persistence(state_dir);
 
+    // Discover open PRs from existing workspaces (covers restarts before
+    // persistence was added, or if the state file was lost)
+    symposium::orchestrator::reconcile::discover_open_prs(&state, &workflows).await;
+
     // Build orchestrator and get event channel for server
     let mut orchestrator =
         symposium::orchestrator::Orchestrator::new(state.clone(), workflows, cli.max_agents);
