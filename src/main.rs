@@ -79,8 +79,11 @@ async fn main() -> anyhow::Result<()> {
         "starting symposium"
     );
 
-    // Build shared orchestrator state (config-agnostic)
-    let state = symposium::domain::state::OrchestratorState::new();
+    // Build shared orchestrator state with persistence for tracked PRs
+    let state_dir = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".symposium");
+    let state = symposium::domain::state::OrchestratorState::with_persistence(state_dir);
 
     // Build orchestrator and get event channel for server
     let mut orchestrator =

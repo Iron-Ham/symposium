@@ -2,9 +2,9 @@ use super::issue::Issue;
 use super::retry::RetryEntry;
 use super::session::LiveSession;
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,10 +22,11 @@ struct StateInner {
     completed: Vec<CompletedEntry>,
     tokens: TokenTotals,
     open_prs: HashMap<String, OpenPr>,
+    state_dir: Option<PathBuf>,
 }
 
 /// A PR opened by Symposium that is being monitored for review feedback.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenPr {
     pub issue: Issue,
     pub pr_number: u64,
@@ -67,6 +68,8 @@ pub struct StateSnapshot {
     pub open_prs: Vec<OpenPr>,
 }
 
+const OPEN_PRS_FILE: &str = "open_prs.json";
+
 impl OrchestratorState {
     pub fn new() -> Self {
         Self {
@@ -76,7 +79,67 @@ impl OrchestratorState {
                 completed: Vec::new(),
                 tokens: TokenTotals::default(),
                 open_prs: HashMap::new(),
+                state_dir: None,
             })),
+        }
+    }
+
+    /// Create state with persistence: loads tracked PRs from disk and
+    /// persists changes on every `track_pr` / `untrack_pr` / `mark_pr_addressed`.
+    pub fn with_persistence(state_dir: PathBuf) -> Self {
+        let open_prs = Self::load_open_prs(&state_dir);
+        if !open_prs.is_empty() {
+            tracing::info!(count = open_prs.len(), "restored tracked PRs from disk");
+        }
+        Self {
+            inner: Arc::new(Mutex::new(StateInner {
+                running: HashMap::new(),
+                retries: HashMap::new(),
+                completed: Vec::new(),
+                tokens: TokenTotals::default(),
+                open_prs,
+                state_dir: Some(state_dir),
+            })),
+        }
+    }
+
+    fn load_open_prs(state_dir: &Path) -> HashMap<String, OpenPr> {
+        let file = state_dir.join(OPEN_PRS_FILE);
+        let data = match std::fs::read_to_string(&file) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+            Err(e) => {
+                tracing::warn!(path = %file.display(), "failed to read persisted PR state: {e}");
+                return HashMap::new();
+            }
+        };
+        match serde_json::from_str(&data) {
+            Ok(prs) => prs,
+            Err(e) => {
+                tracing::warn!(path = %file.display(), "failed to parse persisted PR state: {e}");
+                HashMap::new()
+            }
+        }
+    }
+
+    fn persist_open_prs(&self) {
+        let (state_dir, json) = {
+            let inner = self.inner.lock().unwrap();
+            let dir = match inner.state_dir {
+                Some(ref d) => d.clone(),
+                None => return,
+            };
+            let json = serde_json::to_string_pretty(&inner.open_prs)
+                .unwrap_or_else(|_| "{}".to_string());
+            (dir, json)
+        };
+        let file = state_dir.join(OPEN_PRS_FILE);
+        if let Err(e) = std::fs::create_dir_all(&state_dir) {
+            tracing::warn!(path = %state_dir.display(), "failed to create state dir: {e}");
+            return;
+        }
+        if let Err(e) = std::fs::write(&file, json) {
+            tracing::warn!(path = %file.display(), "failed to persist PR state: {e}");
         }
     }
 
@@ -214,10 +277,12 @@ impl OrchestratorState {
                 workflow_id: workflow_id.to_string(),
             },
         );
+        self.persist_open_prs();
     }
 
     pub fn untrack_pr(&self, state_key: &str) {
         self.inner.lock().unwrap().open_prs.remove(state_key);
+        self.persist_open_prs();
     }
 
     pub fn open_prs(&self) -> Vec<OpenPr> {
@@ -234,6 +299,7 @@ impl OrchestratorState {
         if let Some(pr) = self.inner.lock().unwrap().open_prs.get_mut(state_key) {
             pr.last_addressed_at = Some(Utc::now());
         }
+        self.persist_open_prs();
     }
 
     pub fn snapshot(&self) -> StateSnapshot {
