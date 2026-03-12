@@ -56,102 +56,105 @@ pub async fn run_workflow_tick(
         .map(|g| state.running_count() >= g)
         .unwrap_or(false);
 
-    if (at_workflow_capacity || at_global_capacity) && ready_retries.is_empty() {
-        return Ok(());
-    }
+    let has_capacity =
+        !(at_workflow_capacity || at_global_capacity) || !ready_retries.is_empty();
 
-    // 3. Connect to Notion tracker and fetch candidates (skip if no active states)
-    let has_notion = !config.tracker.active_states.is_empty();
-    let mut tracker: Option<NotionTracker> = None;
-    let mut candidates: Vec<Issue> = Vec::new();
+    // 3-7: Fetch candidates, dispatch workers, and clean up terminal issues.
+    // Gated behind capacity check — but PR review checks (step 8) always run.
+    if has_capacity {
+        // 3. Connect to Notion tracker and fetch candidates (skip if no active states)
+        let has_notion = !config.tracker.active_states.is_empty();
+        let mut tracker: Option<NotionTracker> = None;
+        let mut candidates: Vec<Issue> = Vec::new();
 
-    if has_notion {
-        match NotionTracker::new(config.tracker.clone()).await {
-            Ok(t) => {
-                tracker = Some(t);
-            }
-            Err(e) => {
-                tracing::error!(workflow = %wf_id, "failed to connect to tracker: {e}");
-                return Ok(());
-            }
-        };
+        if has_notion {
+            match NotionTracker::new(config.tracker.clone()).await {
+                Ok(t) => {
+                    tracker = Some(t);
+                }
+                Err(e) => {
+                    tracing::error!(workflow = %wf_id, "failed to connect to tracker: {e}");
+                    return Ok(());
+                }
+            };
 
-        match tracker.as_mut().unwrap().fetch_candidate_issues().await {
-            Ok(issues) => {
-                tracing::info!(
-                    workflow = %wf_id,
-                    database_id = %config.tracker.database_id,
-                    count = issues.len(),
-                    "fetched Notion candidates"
-                );
-                candidates = issues;
-            }
-            Err(e) => {
-                tracing::error!(workflow = %wf_id, "failed to fetch candidates: {e}");
-                return Ok(());
-            }
-        }
-
-        // Tag all candidates with the workflow ID
-        for issue in &mut candidates {
-            issue.workflow_id = wf_id.0.clone();
-        }
-    } else {
-        tracing::debug!(workflow = %wf_id, "skipping Notion tracker (no active_states)");
-    }
-
-    // 3b. Fetch from Sentry (if enabled)
-    let mut sentry_tracker: Option<SentryTracker> = None;
-    if config.sentry.enabled {
-        match SentryTracker::new(config.sentry.clone()).await {
-            Ok(mut sentry) => match sentry.fetch_candidate_issues().await {
-                Ok(mut sentry_issues) => {
+            match tracker.as_mut().unwrap().fetch_candidate_issues().await {
+                Ok(issues) => {
                     tracing::info!(
                         workflow = %wf_id,
-                        project = %config.sentry.project,
-                        count = sentry_issues.len(),
-                        "fetched Sentry candidates"
+                        database_id = %config.tracker.database_id,
+                        count = issues.len(),
+                        "fetched Notion candidates"
                     );
-                    for issue in &mut sentry_issues {
-                        issue.workflow_id = wf_id.0.clone();
-                    }
-                    candidates.extend(sentry_issues);
-                    sentry_tracker = Some(sentry);
+                    candidates = issues;
                 }
-                Err(e) => tracing::error!(workflow = %wf_id, "failed to fetch Sentry issues: {e}"),
-            },
-            Err(e) => tracing::error!(workflow = %wf_id, "failed to create Sentry tracker: {e}"),
+                Err(e) => {
+                    tracing::error!(workflow = %wf_id, "failed to fetch candidates: {e}");
+                    return Ok(());
+                }
+            }
+
+            // Tag all candidates with the workflow ID
+            for issue in &mut candidates {
+                issue.workflow_id = wf_id.0.clone();
+            }
+        } else {
+            tracing::debug!(workflow = %wf_id, "skipping Notion tracker (no active_states)");
+        }
+
+        // 3b. Fetch from Sentry (if enabled)
+        let mut sentry_tracker: Option<SentryTracker> = None;
+        if config.sentry.enabled {
+            match SentryTracker::new(config.sentry.clone()).await {
+                Ok(mut sentry) => match sentry.fetch_candidate_issues().await {
+                    Ok(mut sentry_issues) => {
+                        tracing::info!(
+                            workflow = %wf_id,
+                            project = %config.sentry.project,
+                            count = sentry_issues.len(),
+                            "fetched Sentry candidates"
+                        );
+                        for issue in &mut sentry_issues {
+                            issue.workflow_id = wf_id.0.clone();
+                        }
+                        candidates.extend(sentry_issues);
+                        sentry_tracker = Some(sentry);
+                    }
+                    Err(e) => tracing::error!(workflow = %wf_id, "failed to fetch Sentry issues: {e}"),
+                },
+                Err(e) => tracing::error!(workflow = %wf_id, "failed to create Sentry tracker: {e}"),
+            }
+        }
+
+        // 4. Sort by priority and filter eligible
+        dispatch::sort_candidates(&mut candidates);
+
+        // 5. Dispatch eligible issues (up to remaining capacity)
+        for issue in candidates {
+            if !dispatch::is_eligible(&issue, state, &config, wf_id, global_max_agents) {
+                continue;
+            }
+
+            dispatch_issue(issue, state, &config, &workflow.config_rx, event_tx, wf_id);
+        }
+
+        // 6. Re-dispatch ready retries
+        for retry in ready_retries {
+            dispatch_retry(retry, state, &config, &workflow.config_rx, event_tx, wf_id);
+        }
+
+        // 7. Clean up workspaces for terminal issues (only if Notion tracker is active)
+        if let Some(ref mut t) = tracker {
+            cleanup_terminal(t, state, &workflow.config_rx, wf_id).await;
+        }
+
+        // 7b. Clean up Sentry terminal issues (reuse the tracker from step 3b)
+        if let Some(ref mut sentry) = sentry_tracker {
+            cleanup_terminal_sentry(sentry, state, &workflow.config_rx, wf_id).await;
         }
     }
 
-    // 4. Sort by priority and filter eligible
-    dispatch::sort_candidates(&mut candidates);
-
-    // 5. Dispatch eligible issues (up to remaining capacity)
-    for issue in candidates {
-        if !dispatch::is_eligible(&issue, state, &config, wf_id, global_max_agents) {
-            continue;
-        }
-
-        dispatch_issue(issue, state, &config, &workflow.config_rx, event_tx, wf_id);
-    }
-
-    // 6. Re-dispatch ready retries
-    for retry in ready_retries {
-        dispatch_retry(retry, state, &config, &workflow.config_rx, event_tx, wf_id);
-    }
-
-    // 7. Clean up workspaces for terminal issues (only if Notion tracker is active)
-    if let Some(ref mut t) = tracker {
-        cleanup_terminal(t, state, &workflow.config_rx, wf_id).await;
-    }
-
-    // 7b. Clean up Sentry terminal issues (reuse the tracker from step 3b)
-    if let Some(ref mut sentry) = sentry_tracker {
-        cleanup_terminal_sentry(sentry, state, &workflow.config_rx, wf_id).await;
-    }
-
-    // 8. Check open PRs for review feedback
+    // 8. Check open PRs for review feedback (always runs — has its own capacity guards)
     if config.pr_review.enabled {
         pr_review::check_and_dispatch_pr_reviews(
             state,
