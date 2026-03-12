@@ -19,9 +19,9 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(dashboard))
-        .route("/issue/{id}", get(issue_detail))
+        .route("/issue/{*id}", get(issue_detail))
         .route("/api/v1/state", get(get_state))
-        .route("/api/v1/issues/{id}", get(get_issue))
+        .route("/api/v1/issues/{*id}", get(get_issue))
         .route("/api/v1/refresh", post(refresh))
         .layer(CorsLayer::permissive())
         .with_state(state)
