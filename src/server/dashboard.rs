@@ -62,7 +62,7 @@ pub fn render(snapshot: &StateSnapshot) -> String {
             format!(
                 "<tr><td><span class=\"workflow-badge\">{}</span></td><td><a href=\"/issue/{}\">{}</a></td><td>{}</td><td>{:?}</td><td>{}</td></tr>",
                 html_escape(&entry.workflow_id),
-                html_escape(&entry.session.issue_id.replace('/', "%2F")),
+                html_escape(&entry.session.issue_id),
                 html_escape(&entry.issue.identifier),
                 html_escape(&entry.issue.title),
                 entry.session.status,
@@ -155,7 +155,8 @@ pub fn render_issue_detail(snapshot: &StateSnapshot, issue_id: &str) -> String {
         return format!(
             r#"<!DOCTYPE html>
 <html><head><title>Not Found</title><meta charset="utf-8"><style>{STYLE}</style></head>
-<body><h1><a href="/">← Symposium</a></h1><div class="empty">Issue {issue_id} not found in running sessions</div></body></html>"#,
+<body><h1><a href="/">← Symposium</a></h1><div class="empty">Issue {} not found in running sessions</div></body></html>"#,
+            html_escape(issue_id),
         );
     };
 
