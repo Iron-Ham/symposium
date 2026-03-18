@@ -328,7 +328,7 @@ async fn run_pr_review_worker(
 
     let runner = agent::AgentRunner::new(config.clone());
     let (mut worker, _mcp_guard) = runner
-        .start_session(&agent_dir, &prompt_text, review_state_key)
+        .start_session(&agent_dir, &prompt_text, &pr.issue.identifier)
         .await?;
 
     let success = run_agent_attempt(&mut worker, &prompt_text, state, review_state_key).await?;
