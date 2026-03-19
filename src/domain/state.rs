@@ -1,6 +1,6 @@
 use super::issue::Issue;
 use super::retry::RetryEntry;
-use super::session::LiveSession;
+use super::session::{AgentEvent, LiveSession, RunStatus};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -43,12 +43,16 @@ pub struct RunningEntry {
     pub workflow_id: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletedEntry {
     pub issue_id: String,
+    pub issue: Issue,
     pub success: bool,
     pub error: Option<String>,
+    pub started_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
+    pub status: RunStatus,
+    pub events: Vec<AgentEvent>,
     pub attempts: u32,
     pub workflow_id: String,
 }
@@ -69,6 +73,7 @@ pub struct StateSnapshot {
 }
 
 const OPEN_PRS_FILE: &str = "open_prs.json";
+const COMPLETED_FILE: &str = "completed_sessions.json";
 
 impl OrchestratorState {
     pub fn new() -> Self {
@@ -84,18 +89,22 @@ impl OrchestratorState {
         }
     }
 
-    /// Create state with persistence: loads tracked PRs from disk and
-    /// persists changes on every `track_pr` / `untrack_pr` / `mark_pr_addressed`.
+    /// Create state with persistence: loads tracked PRs and completed sessions
+    /// from disk and persists changes on mutations.
     pub fn with_persistence(state_dir: PathBuf) -> Self {
         let open_prs = Self::load_open_prs(&state_dir);
         if !open_prs.is_empty() {
             tracing::info!(count = open_prs.len(), "restored tracked PRs from disk");
         }
+        let completed = Self::load_completed(&state_dir);
+        if !completed.is_empty() {
+            tracing::info!(count = completed.len(), "restored completed sessions from disk");
+        }
         Self {
             inner: Arc::new(Mutex::new(StateInner {
                 running: HashMap::new(),
                 retries: HashMap::new(),
-                completed: Vec::new(),
+                completed,
                 tokens: TokenTotals::default(),
                 open_prs,
                 state_dir: Some(state_dir),
@@ -129,9 +138,13 @@ impl OrchestratorState {
                 Some(ref d) => d.clone(),
                 None => return,
             };
-            let json = serde_json::to_string_pretty(&inner.open_prs)
-                .unwrap_or_else(|_| "{}".to_string());
-            (dir, json)
+            match serde_json::to_string_pretty(&inner.open_prs) {
+                Ok(json) => (dir, json),
+                Err(e) => {
+                    tracing::warn!("failed to serialize PR state, skipping persist: {e}");
+                    return;
+                }
+            }
         };
         let file = state_dir.join(OPEN_PRS_FILE);
         if let Err(e) = std::fs::create_dir_all(&state_dir) {
@@ -140,6 +153,50 @@ impl OrchestratorState {
         }
         if let Err(e) = std::fs::write(&file, json) {
             tracing::warn!(path = %file.display(), "failed to persist PR state: {e}");
+        }
+    }
+
+    fn load_completed(state_dir: &Path) -> Vec<CompletedEntry> {
+        let file = state_dir.join(COMPLETED_FILE);
+        let data = match std::fs::read_to_string(&file) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => {
+                tracing::warn!(path = %file.display(), "failed to read completed sessions: {e}");
+                return Vec::new();
+            }
+        };
+        match serde_json::from_str(&data) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(path = %file.display(), "failed to parse completed sessions: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    fn persist_completed(&self) {
+        let (state_dir, json) = {
+            let inner = self.inner.lock().unwrap();
+            let dir = match inner.state_dir {
+                Some(ref d) => d.clone(),
+                None => return,
+            };
+            match serde_json::to_string_pretty(&inner.completed) {
+                Ok(json) => (dir, json),
+                Err(e) => {
+                    tracing::warn!("failed to serialize completed sessions, skipping persist: {e}");
+                    return;
+                }
+            }
+        };
+        let file = state_dir.join(COMPLETED_FILE);
+        if let Err(e) = std::fs::create_dir_all(&state_dir) {
+            tracing::warn!(path = %state_dir.display(), "failed to create state dir: {e}");
+            return;
+        }
+        if let Err(e) = std::fs::write(&file, json) {
+            tracing::warn!(path = %file.display(), "failed to persist completed sessions: {e}");
         }
     }
 
@@ -190,25 +247,30 @@ impl OrchestratorState {
     }
 
     pub fn mark_worker_done(&self, state_key: &str, success: bool, error: Option<String>) {
-        let mut inner = self.inner.lock().unwrap();
-        let (attempts, workflow_id) = inner
-            .running
-            .get(state_key)
-            .map(|e| (e.session.attempts.len() as u32, e.workflow_id.clone()))
-            .unwrap_or((0, String::new()));
-        inner.running.remove(state_key);
-        inner.completed.push(CompletedEntry {
-            issue_id: state_key.to_string(),
-            success,
-            error,
-            completed_at: Utc::now(),
-            attempts,
-            workflow_id,
-        });
-        if inner.completed.len() > MAX_COMPLETED {
-            let drain_count = inner.completed.len() - MAX_COMPLETED;
-            inner.completed.drain(..drain_count);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let Some(entry) = inner.running.remove(state_key) else {
+                tracing::warn!(state_key, "mark_worker_done called for unknown session, ignoring");
+                return;
+            };
+            inner.completed.push(CompletedEntry {
+                issue_id: state_key.to_string(),
+                issue: entry.issue,
+                success,
+                error,
+                started_at: entry.session.started_at,
+                completed_at: Utc::now(),
+                status: entry.session.status,
+                events: entry.session.events,
+                attempts: entry.session.attempts.len() as u32,
+                workflow_id: entry.workflow_id,
+            });
+            if inner.completed.len() > MAX_COMPLETED {
+                let drain_count = inner.completed.len() - MAX_COMPLETED;
+                inner.completed.drain(..drain_count);
+            }
         }
+        self.persist_completed();
     }
 
     pub fn mark_retry_ready(&self, state_key: &str) {
@@ -314,7 +376,29 @@ impl OrchestratorState {
     }
 
     pub fn get_issue_detail(&self, state_key: &str) -> Option<RunningEntry> {
-        self.inner.lock().unwrap().running.get(state_key).cloned()
+        let inner = self.inner.lock().unwrap();
+        if let Some(entry) = inner.running.get(state_key) {
+            return Some(entry.clone());
+        }
+        // Fall back to completed entries for historical log viewing.
+        inner
+            .completed
+            .iter()
+            .find(|e| e.issue_id == state_key)
+            .map(|e| RunningEntry {
+                issue: e.issue.clone(),
+                session: LiveSession {
+                    issue_id: e.issue_id.clone(),
+                    thread_id: None,
+                    status: e.status.clone(),
+                    started_at: e.started_at,
+                    last_activity: e.completed_at,
+                    attempts: Vec::new(),
+                    events: e.events.clone(),
+                },
+                stall_timeout: Duration::ZERO,
+                workflow_id: e.workflow_id.clone(),
+            })
     }
 
     /// Find sessions with no activity within their per-entry stall timeout.
