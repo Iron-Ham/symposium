@@ -76,9 +76,10 @@ pub fn render(snapshot: &StateSnapshot) -> String {
         .iter()
         .map(|entry| {
             format!(
-                "<tr><td><span class=\"workflow-badge\">{}</span></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td><span class=\"workflow-badge\">{}</span></td><td><a href=\"/issue/{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 html_escape(&entry.workflow_id),
                 html_escape(&entry.issue_id),
+                html_escape(&entry.issue.identifier),
                 if entry.success { "&#10003; Success" } else { "&#10007; Failed" },
                 entry.attempts,
                 entry.completed_at.format("%H:%M:%S")
@@ -146,23 +147,59 @@ pub fn render(snapshot: &StateSnapshot) -> String {
 
 /// Render a detail page for a specific issue.
 pub fn render_issue_detail(snapshot: &StateSnapshot, issue_id: &str) -> String {
-    let entry = snapshot
+    // Check running sessions first, then completed sessions.
+    let running_entry = snapshot
         .running
         .iter()
         .find(|e| e.session.issue_id == issue_id || e.issue.identifier == issue_id);
 
-    let Some(entry) = entry else {
-        return format!(
-            r#"<!DOCTYPE html>
-<html><head><title>Not Found</title><meta charset="utf-8"><style>{STYLE}</style></head>
-<body><h1><a href="/">← Symposium</a></h1><div class="empty">Issue {} not found in running sessions</div></body></html>"#,
-            html_escape(issue_id),
-        );
-    };
+    let completed_entry = snapshot.completed.iter().find(|e| {
+        e.issue_id == issue_id || e.issue.identifier == issue_id
+    });
 
-    let events_html: String = entry
-        .session
-        .events
+    let is_completed = running_entry.is_none() && completed_entry.is_some();
+
+    // Unify into common variables for the template.
+    let (issue, workflow_id, status, started, last_activity, events_source) =
+        if let Some(entry) = running_entry {
+            (
+                &entry.issue,
+                &entry.workflow_id,
+                format!("{:?}", entry.session.status),
+                entry.session.started_at,
+                entry.session.last_activity,
+                entry.session.events.as_slice(),
+            )
+        } else if let Some(entry) = completed_entry {
+            (
+                &entry.issue,
+                &entry.workflow_id,
+                if entry.success {
+                    "Completed".to_string()
+                } else {
+                    format!(
+                        "Failed{}",
+                        entry
+                            .error
+                            .as_ref()
+                            .map(|e| format!(": {e}"))
+                            .unwrap_or_default()
+                    )
+                },
+                entry.started_at,
+                entry.completed_at,
+                entry.events.as_slice(),
+            )
+        } else {
+            return format!(
+                r#"<!DOCTYPE html>
+<html><head><title>Not Found</title><meta charset="utf-8"><style>{STYLE}</style></head>
+<body><h1><a href="/">← Symposium</a></h1><div class="empty">Issue {} not found</div></body></html>"#,
+                html_escape(issue_id),
+            );
+        };
+
+    let events_html: String = events_source
         .iter()
         .map(|event| {
             let time = event.timestamp.format("%H:%M:%S");
@@ -209,11 +246,27 @@ pub fn render_issue_detail(snapshot: &StateSnapshot, issue_id: &str) -> String {
         })
         .collect();
 
-    let desc = entry
-        .issue
-        .description
-        .as_deref()
-        .unwrap_or("No description");
+    let desc = issue.description.as_deref().unwrap_or("No description");
+
+    // Only auto-reload for running sessions.
+    let reload_script = if is_completed {
+        String::new()
+    } else {
+        r#"<script>
+    (() => {
+        const el = document.querySelector('.events-container');
+        if (!el) return;
+        const wasAtBottom = sessionStorage.getItem('eventsAtBottom') !== 'false';
+        if (wasAtBottom) el.scrollTop = el.scrollHeight;
+        setTimeout(() => {
+            const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
+            sessionStorage.setItem('eventsAtBottom', atBottom);
+            location.reload();
+        }, 3000);
+    })();
+    </script>"#
+            .to_string()
+    };
 
     format!(
         r#"<!DOCTYPE html>
@@ -230,7 +283,7 @@ pub fn render_issue_detail(snapshot: &StateSnapshot, issue_id: &str) -> String {
 
     <div class="meta">
         <div class="meta-row"><span class="meta-label">Workflow</span><span class="workflow-badge">{workflow}</span></div>
-        <div class="meta-row"><span class="meta-label">Status</span><span>{status:?}</span></div>
+        <div class="meta-row"><span class="meta-label">Status</span><span>{status}</span></div>
         <div class="meta-row"><span class="meta-label">Priority</span><span>{priority}</span></div>
         <div class="meta-row"><span class="meta-label">Started</span><span>{started}</span></div>
         <div class="meta-row"><span class="meta-label">Last Activity</span><span>{last_activity}</span></div>
@@ -242,33 +295,22 @@ pub fn render_issue_detail(snapshot: &StateSnapshot, issue_id: &str) -> String {
         {events}
     </div>
 
-    <script>
-    (() => {{
-        const el = document.querySelector('.events-container');
-        if (!el) return;
-        const wasAtBottom = sessionStorage.getItem('eventsAtBottom') !== 'false';
-        if (wasAtBottom) el.scrollTop = el.scrollHeight;
-        setTimeout(() => {{
-            const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
-            sessionStorage.setItem('eventsAtBottom', atBottom);
-            location.reload();
-        }}, 3000);
-    }})();
-    </script>
+    {reload_script}
 </body>
 </html>"#,
-        id = entry.issue.identifier,
-        title = html_escape(&entry.issue.title),
-        workflow = html_escape(&entry.workflow_id),
-        status = entry.session.status,
-        priority = html_escape(entry.issue.priority.as_deref().unwrap_or("—")),
-        started = entry.session.started_at.format("%H:%M:%S"),
-        last_activity = entry.session.last_activity.format("%H:%M:%S"),
+        id = html_escape(&issue.identifier),
+        title = html_escape(&issue.title),
+        workflow = html_escape(workflow_id),
+        status = html_escape(&status),
+        priority = html_escape(issue.priority.as_deref().unwrap_or("—")),
+        started = started.format("%H:%M:%S"),
+        last_activity = last_activity.format("%H:%M:%S"),
         description = html_escape(desc),
         events = if events_html.is_empty() {
             "<div class=\"empty\">No events yet</div>".to_string()
         } else {
             events_html
         },
+        reload_script = reload_script,
     )
 }
