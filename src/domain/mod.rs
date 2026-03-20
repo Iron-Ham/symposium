@@ -1,3 +1,4 @@
+pub mod epic;
 pub mod issue;
 pub mod retry;
 pub mod session;

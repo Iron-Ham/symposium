@@ -13,6 +13,18 @@ pub struct HttpMcpClient {
 }
 
 impl HttpMcpClient {
+    /// Create a disconnected client for testing (no network calls).
+    #[cfg(test)]
+    pub fn disconnected() -> Self {
+        Self {
+            url: String::new(),
+            http: reqwest::Client::new(),
+            oauth: OAuthClient::new("http://test"),
+            next_id: AtomicU64::new(1),
+            session_id: None,
+        }
+    }
+
     pub async fn new(url: &str) -> Result<Self> {
         let oauth = OAuthClient::new(url);
         let mut client = Self {

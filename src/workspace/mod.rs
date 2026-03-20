@@ -31,24 +31,26 @@ impl WorkspaceManager {
         Ok(dir)
     }
 
-    /// Render a hook script through Liquid with issue context and workspace path.
+    /// Render a hook script through Liquid with issue context, workspace path, and base branch.
     fn render_hook(
         &self,
         hook: &str,
         issue: &Issue,
         attempt: Option<u32>,
         workspace: &Path,
+        base_branch: Option<&str>,
     ) -> Result<String> {
-        prompt::build_prompt_with_workspace(
+        prompt::build_prompt_full(
             hook,
             issue,
             attempt,
             workspace.to_str(),
+            base_branch,
         )
     }
 
     /// Ensure the workspace directory exists, run after_create hook if newly created.
-    pub async fn ensure(&self, issue: &Issue) -> Result<PathBuf> {
+    pub async fn ensure(&self, issue: &Issue, base_branch: Option<&str>) -> Result<PathBuf> {
         let dir = self.workspace_dir(&issue.identifier)?;
         let newly_created = !dir.exists();
 
@@ -66,7 +68,7 @@ impl WorkspaceManager {
                     })?;
                 }
                 tracing::info!(issue_key = issue.identifier, path = %dir.display(), "creating workspace");
-                let rendered = self.render_hook(hook, issue, None, &dir)?;
+                let rendered = self.render_hook(hook, issue, None, &dir, base_branch)?;
                 // Run hook from the parent directory since workspace doesn't exist yet
                 let cwd = dir.parent().unwrap_or(&dir);
                 hooks::run_hook(&rendered, cwd, config.hooks.timeout()).await?;
@@ -85,22 +87,22 @@ impl WorkspaceManager {
     }
 
     /// Run the before_run hook in the workspace.
-    pub async fn prepare(&self, issue: &Issue, attempt: Option<u32>) -> Result<PathBuf> {
+    pub async fn prepare(&self, issue: &Issue, attempt: Option<u32>, base_branch: Option<&str>) -> Result<PathBuf> {
         let dir = self.workspace_dir(&issue.identifier)?;
         let config = self.config_rx.borrow().clone();
         if let Some(hook) = &config.hooks.before_run {
-            let rendered = self.render_hook(hook, issue, attempt, &dir)?;
+            let rendered = self.render_hook(hook, issue, attempt, &dir, base_branch)?;
             hooks::run_hook(&rendered, &dir, config.hooks.timeout()).await?;
         }
         Ok(dir)
     }
 
     /// Run the after_run hook in the workspace.
-    pub async fn finish(&self, issue: &Issue, success: bool) -> Result<()> {
+    pub async fn finish(&self, issue: &Issue, success: bool, base_branch: Option<&str>) -> Result<()> {
         let dir = self.workspace_dir(&issue.identifier)?;
         let config = self.config_rx.borrow().clone();
         if let Some(hook) = &config.hooks.after_run {
-            let rendered = self.render_hook(hook, issue, None, &dir)?;
+            let rendered = self.render_hook(hook, issue, None, &dir, base_branch)?;
             let mut env = std::collections::HashMap::new();
             env.insert(
                 "RUN_SUCCESS".to_string(),

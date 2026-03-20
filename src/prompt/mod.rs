@@ -4,7 +4,7 @@ use liquid::ParserBuilder;
 
 /// Render the prompt template with issue data.
 pub fn build_prompt(template_str: &str, issue: &Issue, attempt: Option<u32>) -> Result<String> {
-    build_prompt_with_workspace(template_str, issue, attempt, None)
+    build_prompt_full(template_str, issue, attempt, None, None)
 }
 
 /// Render a template with issue data and an optional workspace path.
@@ -13,6 +13,17 @@ pub fn build_prompt_with_workspace(
     issue: &Issue,
     attempt: Option<u32>,
     workspace: Option<&str>,
+) -> Result<String> {
+    build_prompt_full(template_str, issue, attempt, workspace, None)
+}
+
+/// Render a template with issue data, workspace path, and base branch.
+pub fn build_prompt_full(
+    template_str: &str,
+    issue: &Issue,
+    attempt: Option<u32>,
+    workspace: Option<&str>,
+    base_branch: Option<&str>,
 ) -> Result<String> {
     let parser = ParserBuilder::with_stdlib()
         .build()
@@ -78,9 +89,50 @@ pub fn build_prompt_with_workspace(
         );
     }
 
+    if let Some(branch) = base_branch {
+        globals.insert(
+            "base_branch".into(),
+            liquid::model::Value::scalar(branch.to_string()),
+        );
+    }
+
     template
         .render(&globals)
         .map_err(|e| Error::Prompt(format!("failed to render template: {e}")))
+}
+
+/// Resolve the agent working directory from a workspace dir and subdirectory template.
+///
+/// If `subdirectory_template` is `None` or renders to empty/whitespace, returns
+/// `workspace_dir` directly. Otherwise, renders the template with issue context
+/// (supporting Liquid expressions like `{% if issue.title contains '[iOS]' %}mail-ios{% endif %}`)
+/// and joins the result with `workspace_dir`.
+pub fn resolve_agent_dir(
+    workspace_dir: &std::path::Path,
+    subdirectory_template: Option<&str>,
+    issue: &Issue,
+) -> std::path::PathBuf {
+    let Some(tmpl) = subdirectory_template else {
+        return workspace_dir.to_path_buf();
+    };
+    if tmpl.is_empty() {
+        return workspace_dir.to_path_buf();
+    }
+
+    match build_prompt(tmpl, issue, None) {
+        Ok(rendered) => {
+            let rendered = rendered.trim();
+            if rendered.is_empty() {
+                workspace_dir.to_path_buf()
+            } else {
+                workspace_dir.join(rendered)
+            }
+        }
+        Err(e) => {
+            tracing::warn!("failed to render agent_subdirectory template: {e}, using workspace root");
+            workspace_dir.to_path_buf()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -213,5 +265,66 @@ mod tests {
         let template = "{% if issue.comments != blank %}Comments:\n{{ issue.comments }}{% else %}No comments{% endif %}";
         let result = build_prompt(template, &issue, None).unwrap();
         assert_eq!(result, "No comments");
+    }
+
+    #[test]
+    fn test_base_branch_render() {
+        let issue = Issue {
+            identifier: "TASK-1".to_string(),
+            title: "Test".to_string(),
+            description: None,
+            status: "Todo".to_string(),
+            priority: None,
+            url: None,
+            notion_page_id: None,
+            blockers: vec![],
+            source: "notion".to_string(),
+            extra: HashMap::new(),
+            comments: vec![],
+            workflow_id: String::new(),
+        };
+
+        let template = "git rebase origin/{{ base_branch }}";
+        let result = build_prompt_full(template, &issue, None, None, Some("symposium/task-TASK-99")).unwrap();
+        assert_eq!(result, "git rebase origin/symposium/task-TASK-99");
+    }
+
+    #[test]
+    fn test_resolve_agent_dir_with_liquid() {
+        use std::path::PathBuf;
+
+        let ios_issue = Issue {
+            identifier: "TASK-1".to_string(),
+            title: "[iOS] Gate: swipe gesture".to_string(),
+            description: None,
+            status: "Todo".to_string(),
+            priority: None,
+            url: None,
+            notion_page_id: None,
+            blockers: vec![],
+            source: "notion".to_string(),
+            extra: HashMap::new(),
+            comments: vec![],
+            workflow_id: String::new(),
+        };
+        let backend_issue = Issue {
+            title: "[Backend] API endpoints".to_string(),
+            ..ios_issue.clone()
+        };
+
+        let ws = PathBuf::from("/tmp/workspace");
+        let tmpl = "{% if issue.title contains '[iOS]' %}mail-ios{% endif %}";
+
+        // iOS task → subdirectory
+        let dir = resolve_agent_dir(&ws, Some(tmpl), &ios_issue);
+        assert_eq!(dir, PathBuf::from("/tmp/workspace/mail-ios"));
+
+        // Backend task → workspace root (template renders to empty)
+        let dir = resolve_agent_dir(&ws, Some(tmpl), &backend_issue);
+        assert_eq!(dir, PathBuf::from("/tmp/workspace"));
+
+        // No template → workspace root
+        let dir = resolve_agent_dir(&ws, None, &ios_issue);
+        assert_eq!(dir, PathBuf::from("/tmp/workspace"));
     }
 }

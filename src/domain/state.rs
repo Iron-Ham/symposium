@@ -1,3 +1,4 @@
+use super::epic::EpicGraph;
 use super::issue::Issue;
 use super::retry::RetryEntry;
 use super::session::{AgentEvent, LiveSession, RunStatus};
@@ -23,6 +24,7 @@ struct StateInner {
     tokens: TokenTotals,
     open_prs: HashMap<String, OpenPr>,
     state_dir: Option<PathBuf>,
+    epic_graph: Option<EpicGraph>,
 }
 
 /// A PR opened by Symposium that is being monitored for review feedback.
@@ -33,6 +35,9 @@ pub struct OpenPr {
     pub workspace_dir: PathBuf,
     pub last_addressed_at: Option<DateTime<Utc>>,
     pub workflow_id: String,
+    /// The git branch name for this PR (e.g. "symposium/task-TASK-123456").
+    #[serde(default)]
+    pub branch_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,6 +90,7 @@ impl OrchestratorState {
                 tokens: TokenTotals::default(),
                 open_prs: HashMap::new(),
                 state_dir: None,
+                epic_graph: None,
             })),
         }
     }
@@ -108,6 +114,7 @@ impl OrchestratorState {
                 tokens: TokenTotals::default(),
                 open_prs,
                 state_dir: Some(state_dir),
+                epic_graph: None,
             })),
         }
     }
@@ -328,7 +335,15 @@ impl OrchestratorState {
     }
 
 
-    pub fn track_pr(&self, state_key: &str, issue: Issue, pr_number: u64, workspace_dir: PathBuf, workflow_id: &str) {
+    pub fn track_pr(
+        &self,
+        state_key: &str,
+        issue: Issue,
+        pr_number: u64,
+        workspace_dir: PathBuf,
+        workflow_id: &str,
+        branch_name: &str,
+    ) {
         self.inner.lock().unwrap().open_prs.insert(
             state_key.to_string(),
             OpenPr {
@@ -337,6 +352,7 @@ impl OrchestratorState {
                 workspace_dir,
                 last_addressed_at: None,
                 workflow_id: workflow_id.to_string(),
+                branch_name: branch_name.to_string(),
             },
         );
         self.persist_open_prs();
@@ -399,6 +415,16 @@ impl OrchestratorState {
                 stall_timeout: Duration::ZERO,
                 workflow_id: e.workflow_id.clone(),
             })
+    }
+
+    /// Store the epic dependency graph.
+    pub fn set_epic_graph(&self, graph: EpicGraph) {
+        self.inner.lock().unwrap().epic_graph = Some(graph);
+    }
+
+    /// Get a clone of the epic graph, if set.
+    pub fn epic_graph(&self) -> Option<EpicGraph> {
+        self.inner.lock().unwrap().epic_graph.clone()
     }
 
     /// Find sessions with no activity within their per-entry stall timeout.

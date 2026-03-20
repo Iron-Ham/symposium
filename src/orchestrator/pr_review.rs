@@ -79,6 +79,19 @@ pub async fn check_and_dispatch_pr_reviews(
                         state = status.state,
                         "PR reached terminal state, untracking"
                     );
+                    // Update Notion status on merge (e.g. set to "Completed")
+                    if status.state == "MERGED"
+                        && let Some(ref target_status) = config.tracker.on_pr_merged_status
+                        && let Some(ref page_id) = pr.issue.notion_page_id
+                    {
+                        super::tick::update_notion_status(
+                            &config.tracker,
+                            page_id,
+                            &config.tracker.property_status,
+                            target_status,
+                        )
+                        .await;
+                    }
                     state.untrack_pr(&pr_state_key);
                     continue;
                 }
@@ -303,7 +316,9 @@ async fn run_pr_review_worker(
         }),
     );
     let ws = WorkspaceManager::new(config_rx.clone());
-    ws.prepare(&pr.issue, None).await?;
+    // PR review runs on an existing workspace/branch — base_branch is not needed.
+    // The before_run hook should use `git fetch && git rebase` without a base branch ref.
+    ws.prepare(&pr.issue, None, None).await?;
 
     // Build prompt
     let prompt_text = build_pr_review_prompt(
@@ -321,10 +336,11 @@ async fn run_pr_review_worker(
     );
     state.update_session_status(review_state_key, RunStatus::Running);
 
-    let agent_dir = match &config.workspace.agent_subdirectory {
-        Some(sub) => workspace_dir.join(sub),
-        None => workspace_dir.clone(),
-    };
+    let agent_dir = crate::prompt::resolve_agent_dir(
+        workspace_dir,
+        config.workspace.agent_subdirectory.as_deref(),
+        &pr.issue,
+    );
 
     let runner = agent::AgentRunner::new(config.clone());
     let (mut worker, _mcp_guard) = runner
@@ -334,7 +350,7 @@ async fn run_pr_review_worker(
     let success = run_agent_attempt(&mut worker, &prompt_text, state, review_state_key).await?;
 
     // Run after_run hook
-    ws.finish(&pr.issue, success).await?;
+    ws.finish(&pr.issue, success, None).await?;
 
     Ok(success)
 }
@@ -432,6 +448,7 @@ mod tests {
             workspace_dir: "/tmp".into(),
             last_addressed_at: None,
             workflow_id: "default".to_string(),
+            branch_name: String::new(),
         };
         let status = PrStatus {
             state: "OPEN".into(),
@@ -448,6 +465,7 @@ mod tests {
             workspace_dir: "/tmp".into(),
             last_addressed_at: None,
             workflow_id: "default".to_string(),
+            branch_name: String::new(),
         };
         let status = PrStatus {
             state: "OPEN".into(),
@@ -465,6 +483,7 @@ mod tests {
             workspace_dir: "/tmp".into(),
             last_addressed_at: Some(now),
             workflow_id: "default".to_string(),
+            branch_name: String::new(),
         };
         let status = PrStatus {
             state: "OPEN".into(),
@@ -482,6 +501,7 @@ mod tests {
             workspace_dir: "/tmp".into(),
             last_addressed_at: Some(now - chrono::Duration::hours(1)),
             workflow_id: "default".to_string(),
+            branch_name: String::new(),
         };
         let status = PrStatus {
             state: "OPEN".into(),
@@ -644,6 +664,7 @@ mod tests {
             workspace_dir: "/tmp/ws".into(),
             last_addressed_at: None,
             workflow_id: "default".to_string(),
+            branch_name: String::new(),
         };
         let status = PrStatus {
             state,

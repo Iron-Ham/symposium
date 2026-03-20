@@ -77,7 +77,34 @@ impl NotionTracker {
         if let Some(ref prop) = self.config.skip_if_set {
             query.push_str(&format!(" AND \"{prop}\" IS NULL"));
         }
+        if let Some(ref parent_id) = self.config.parent_page_id {
+            query.push_str(&format!(
+                " AND \"{}\" LIKE '%{parent_id}%'",
+                self.config.property_parent
+            ));
+        }
+        if let Some(ref type_prop) = self.config.property_type
+            && let Some(ref types) = self.config.eligible_types
+            && !types.is_empty()
+        {
+            let type_list = types
+                .iter()
+                .map(|t| format!("'{t}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            query.push_str(&format!(" AND \"{type_prop}\" IN ({type_list})"));
+        }
         query
+    }
+
+    /// Build a query that fetches ALL sub-tasks of the epic regardless of status.
+    /// Used to build the complete dependency graph for epic workflows.
+    fn build_epic_all_tasks_query(&self, ds_id: &str) -> Option<String> {
+        let parent_id = self.config.parent_page_id.as_ref()?;
+        Some(format!(
+            "SELECT * FROM \"{ds_id}\" WHERE \"{}\" LIKE '%{parent_id}%'",
+            self.config.property_parent
+        ))
     }
 
     /// Unwrap the MCP tool response to get the inner data.
@@ -405,6 +432,50 @@ impl TrackerClient for NotionTracker {
             .await
     }
 
+    async fn update_issue_status(
+        &mut self,
+        page_id: &str,
+        status_property: &str,
+        status_value: &str,
+    ) -> Result<()> {
+        let args = serde_json::json!({
+            "page_id": page_id,
+            "properties": {
+                status_property: {
+                    "status": {
+                        "name": status_value
+                    }
+                }
+            }
+        });
+        self.client
+            .call_tool("notion-update-page", args)
+            .await
+            .map_err(|e| Error::Tracker(format!("failed to update issue status: {e}")))?;
+        tracing::info!(page_id, status = status_value, "updated Notion issue status");
+        Ok(())
+    }
+
+    async fn fetch_all_epic_tasks(&mut self) -> Result<Vec<Issue>> {
+        let ds_url = self.data_source_url();
+        let Some(sql) = self.build_epic_all_tasks_query(&ds_url) else {
+            return Ok(vec![]);
+        };
+        let result = self
+            .client
+            .call_tool(
+                "notion-query-data-sources",
+                serde_json::json!({
+                    "data": {
+                        "data_source_urls": [&ds_url],
+                        "query": sql
+                    }
+                }),
+            )
+            .await?;
+        Ok(self.extract_issues(&result))
+    }
+
     async fn fetch_comments(&mut self, page_id: &str) -> Result<Vec<Comment>> {
         let result = self
             .client
@@ -510,5 +581,107 @@ mod tests {
         let comments = NotionTracker::parse_comments(&data);
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0].body, "Direct text");
+    }
+
+    fn make_config() -> TrackerConfig {
+        TrackerConfig {
+            database_id: "db-123".to_string(),
+            ..TrackerConfig::default()
+        }
+    }
+
+    #[test]
+    fn build_status_query_basic() {
+        let config = make_config();
+        let tracker = NotionTracker {
+            client: McpTransport::Http(HttpMcpClient::disconnected()),
+            config,
+            data_source_id: None,
+        };
+        let ds = "collection://db-123";
+        let q = tracker.build_status_query(ds, &["Todo".to_string(), "In Progress".to_string()]);
+        assert!(q.contains("\"Status\" IN ('Todo', 'In Progress')"));
+        // Should not contain parent or type filters
+        assert!(!q.contains("Parent Task"));
+        assert!(!q.contains("Type"));
+    }
+
+    #[test]
+    fn build_status_query_with_parent_page() {
+        let config = TrackerConfig {
+            parent_page_id: Some("abc123".to_string()),
+            ..make_config()
+        };
+        let tracker = NotionTracker {
+            client: McpTransport::Http(HttpMcpClient::disconnected()),
+            config,
+            data_source_id: None,
+        };
+        let ds = "collection://db-123";
+        let q = tracker.build_status_query(ds, &["Todo".to_string()]);
+        assert!(q.contains("\"Parent Task\" LIKE '%abc123%'"));
+    }
+
+    #[test]
+    fn build_status_query_with_type_filter() {
+        let config = TrackerConfig {
+            property_type: Some("Type".to_string()),
+            eligible_types: Some(vec!["Eng".to_string(), "Feature".to_string()]),
+            ..make_config()
+        };
+        let tracker = NotionTracker {
+            client: McpTransport::Http(HttpMcpClient::disconnected()),
+            config,
+            data_source_id: None,
+        };
+        let ds = "collection://db-123";
+        let q = tracker.build_status_query(ds, &["Todo".to_string()]);
+        assert!(q.contains("\"Type\" IN ('Eng', 'Feature')"));
+    }
+
+    #[test]
+    fn build_status_query_type_filter_requires_both_fields() {
+        // Only property_type set, no eligible_types → no filter
+        let config = TrackerConfig {
+            property_type: Some("Type".to_string()),
+            eligible_types: None,
+            ..make_config()
+        };
+        let tracker = NotionTracker {
+            client: McpTransport::Http(HttpMcpClient::disconnected()),
+            config,
+            data_source_id: None,
+        };
+        let ds = "collection://db-123";
+        let q = tracker.build_status_query(ds, &["Todo".to_string()]);
+        assert!(!q.contains("Type"));
+    }
+
+    #[test]
+    fn build_epic_all_tasks_query_returns_none_without_parent() {
+        let config = make_config();
+        let tracker = NotionTracker {
+            client: McpTransport::Http(HttpMcpClient::disconnected()),
+            config,
+            data_source_id: None,
+        };
+        assert!(tracker.build_epic_all_tasks_query("ds").is_none());
+    }
+
+    #[test]
+    fn build_epic_all_tasks_query_with_parent() {
+        let config = TrackerConfig {
+            parent_page_id: Some("epic-page-id".to_string()),
+            ..make_config()
+        };
+        let tracker = NotionTracker {
+            client: McpTransport::Http(HttpMcpClient::disconnected()),
+            config,
+            data_source_id: None,
+        };
+        let q = tracker.build_epic_all_tasks_query("collection://db-123").unwrap();
+        assert!(q.contains("\"Parent Task\" LIKE '%epic-page-id%'"));
+        // Should NOT contain status filter
+        assert!(!q.contains("Status"));
     }
 }

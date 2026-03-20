@@ -126,16 +126,94 @@ pub async fn run_workflow_tick(
             }
         }
 
-        // 4. Sort by priority and filter eligible
+        // 4. Build epic graph if parent_page_id is set and graph not yet initialized.
+        // Note: the graph is built once and cached for the lifetime of the process.
+        // If tasks are added to the epic or Blocked by relations change after startup,
+        // a restart is required to pick up the changes. New tasks that appear in
+        // candidates but have no graph entry will be treated as having no dependencies.
+        if config.tracker.parent_page_id.is_some()
+            && state.epic_graph().is_none()
+            && let Some(ref mut t) = tracker
+        {
+            match t.fetch_all_epic_tasks().await {
+                Ok(all_tasks) => {
+                    tracing::info!(
+                        workflow = %wf_id,
+                        count = all_tasks.len(),
+                        "fetched all epic sub-tasks for dependency graph"
+                    );
+                    // For now, build graph from Blocked by relations only.
+                    // Mermaid parsing requires fetching the epic page content,
+                    // which can be added later.
+                    let mut graph = crate::domain::epic::EpicGraph::default();
+                    for task in &all_tasks {
+                        graph
+                            .dependencies
+                            .entry(task.identifier.clone())
+                            .or_default();
+                        // Merge Blocked by relation edges from extra properties
+                        if let Some(blocked_by) = task.extra.get("blocked by") {
+                            let blocker_ids: Vec<String> = blocked_by
+                                .split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            graph.merge_blocked_by(&task.identifier, &blocker_ids);
+                        }
+                    }
+                    state.set_epic_graph(graph);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        workflow = %wf_id,
+                        "failed to fetch epic sub-tasks: {e}"
+                    );
+                }
+            }
+        }
+
+        // 4b. Sort by priority and filter eligible
         dispatch::sort_candidates(&mut candidates);
+        let epic_graph = state.epic_graph();
+
+        // Guard: if parent_page_id is configured but the graph isn't available,
+        // skip dispatching to avoid sending all tasks simultaneously without
+        // dependency ordering. The graph will be retried on the next tick.
+        let skip_epic_dispatch =
+            config.tracker.parent_page_id.is_some() && epic_graph.is_none();
+        if skip_epic_dispatch {
+            tracing::warn!(
+                workflow = %wf_id,
+                candidates = candidates.len(),
+                "epic graph not available — skipping dispatch to preserve dependency ordering"
+            );
+        }
 
         // 5. Dispatch eligible issues (up to remaining capacity)
-        for issue in candidates {
-            if !dispatch::is_eligible(&issue, state, &config, wf_id, global_max_agents) {
-                continue;
-            }
+        if !skip_epic_dispatch {
+            for issue in candidates {
+                let decision = dispatch::check_eligible(
+                    &issue,
+                    state,
+                    &config,
+                    wf_id,
+                    global_max_agents,
+                    epic_graph.as_ref(),
+                );
+                if !decision.eligible {
+                    continue;
+                }
 
-            dispatch_issue(issue, state, &config, &workflow.config_rx, event_tx, wf_id);
+                dispatch_issue(
+                    issue,
+                    state,
+                    &config,
+                    &workflow.config_rx,
+                    event_tx,
+                    wf_id,
+                    &decision.base_branch,
+                );
+            }
         }
 
         // 6. Re-dispatch ready retries
@@ -178,9 +256,10 @@ fn dispatch_issue(
     config_rx: &watch::Receiver<ServiceConfig>,
     event_tx: &mpsc::Sender<OrchestratorEvent>,
     workflow_id: &WorkflowId,
+    base_branch: &str,
 ) {
     let state_key = workflow_id.state_key(&issue.identifier);
-    tracing::info!(state_key, workflow = %workflow_id, "dispatching worker");
+    tracing::info!(state_key, workflow = %workflow_id, base_branch, "dispatching worker");
 
     let stall_timeout = config.codex.stall_timeout();
     state.start_session(&state_key, issue.clone(), stall_timeout, &workflow_id.0);
@@ -190,11 +269,20 @@ fn dispatch_issue(
     let event_tx = event_tx.clone();
     let wf_id = workflow_id.clone();
     let state_key_clone = state_key.clone();
+    let base_branch = base_branch.to_string();
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        let result =
-            run_worker(&issue, &config, &config_rx, None, &state_clone, &state_key_clone).await;
+        let result = run_worker(
+            &issue,
+            &config,
+            &config_rx,
+            None,
+            &state_clone,
+            &state_key_clone,
+            Some(&base_branch),
+        )
+        .await;
 
         let (success, error) = match &result {
             Ok(true) => (true, None),
@@ -280,9 +368,16 @@ fn dispatch_retry(
         // Register the retry session
         state_clone.start_session(&state_key, issue.clone(), stall_timeout, &wf_id.0);
 
-        let result =
-            run_worker(&issue, &config, &config_rx, Some(attempt), &state_clone, &state_key)
-                .await;
+        let result = run_worker(
+            &issue,
+            &config,
+            &config_rx,
+            Some(attempt),
+            &state_clone,
+            &state_key,
+            None, // retries use existing workspace, no base_branch override
+        )
+        .await;
 
         let (success, error) = match &result {
             Ok(true) => (true, None),
@@ -383,6 +478,7 @@ async fn run_worker(
     attempt: Option<u32>,
     state: &OrchestratorState,
     state_key: &str,
+    base_branch: Option<&str>,
 ) -> Result<bool> {
     use crate::domain::session::{AgentEvent, AgentEventKind, RunStatus};
     use crate::workspace::hooks;
@@ -427,10 +523,10 @@ async fn run_worker(
             status: "Setting up workspace".into(),
         }),
     );
-    let workspace_dir = ws.ensure(&issue).await?;
+    let workspace_dir = ws.ensure(&issue, base_branch).await?;
 
     // Run before_run hook
-    ws.prepare(&issue, attempt).await?;
+    ws.prepare(&issue, attempt, base_branch).await?;
 
     // Run pre-flight verification (if enabled)
     if config.preflight.enabled {
@@ -453,11 +549,12 @@ async fn run_worker(
 
             preflight_prompt.push_str(preflight_signal_instructions());
 
-            // Use agent_subdirectory if configured
-            let preflight_dir = match &config.workspace.agent_subdirectory {
-                Some(sub) => workspace_dir.join(sub),
-                None => workspace_dir.clone(),
-            };
+            // Use agent_subdirectory if configured (Liquid-rendered per issue)
+            let preflight_dir = prompt::resolve_agent_dir(
+                &workspace_dir,
+                config.workspace.agent_subdirectory.as_deref(),
+                &issue,
+            );
 
             let preflight_runner = agent::AgentRunner::new(config.clone());
             match preflight_runner
@@ -535,7 +632,7 @@ async fn run_worker(
                     }),
                 );
 
-                ws.finish(&issue, true).await?;
+                ws.finish(&issue, true, base_branch).await?;
                 return Ok(true);
             }
         } else if let Err(e) =
@@ -552,7 +649,13 @@ async fn run_worker(
     // Build prompt from template, with PR metadata instructions appended.
     // The implementer has the best context for writing the initial PR description
     // since it performed the investigation and chose the fix.
-    let mut prompt_text = prompt::build_prompt(&config.prompt_template, &issue, attempt)?;
+    let mut prompt_text = prompt::build_prompt_full(
+        &config.prompt_template,
+        &issue,
+        attempt,
+        None,
+        base_branch,
+    )?;
     prompt_text.push_str(&pr_metadata_instructions(&issue));
 
     // Start agent session
@@ -564,11 +667,12 @@ async fn run_worker(
     );
     state.update_session_status(state_key, RunStatus::Running);
 
-    // Use agent_subdirectory if configured (e.g. "mail-ios" within the repo worktree)
-    let agent_dir = match &config.workspace.agent_subdirectory {
-        Some(sub) => workspace_dir.join(sub),
-        None => workspace_dir.clone(),
-    };
+    // Use agent_subdirectory if configured (Liquid-rendered per issue)
+    let agent_dir = prompt::resolve_agent_dir(
+        &workspace_dir,
+        config.workspace.agent_subdirectory.as_deref(),
+        &issue,
+    );
 
     let runner = agent::AgentRunner::new(config.clone());
     let (mut worker, _mcp_guard) = runner
@@ -668,8 +772,13 @@ async fn run_worker(
         if let Err(e) = tokio::fs::write(&body_file, &pr_body_text).await {
             tracing::warn!(path = %body_file.display(), "failed to write PR body temp file: {e}");
         }
+        let default_branch = &config.workspace.default_branch;
+        let base_flag = match base_branch {
+            Some(b) if b != default_branch => format!(" --base {b}"),
+            _ => String::new(),
+        };
         let pr_script = format!(
-            "git push -u origin HEAD 2>&1 && gh pr create --draft --title \"$(cat {})\" --body-file {} 2>&1",
+            "git push -u origin HEAD 2>&1 && gh pr create --draft{base_flag} --title \"$(cat {})\" --body-file {} 2>&1",
             title_file.display(),
             body_file.display(),
         );
@@ -695,6 +804,19 @@ async fn run_worker(
                     )
                     .await;
                 }
+
+                // Update Notion status on PR creation (e.g. set to "In Review")
+                if let Some(ref target_status) = config.tracker.on_pr_created_status
+                    && let Some(ref page_id) = issue.notion_page_id
+                {
+                    update_notion_status(
+                        &config.tracker,
+                        page_id,
+                        &config.tracker.property_status,
+                        target_status,
+                    )
+                    .await;
+                }
             }
             Err(e) => {
                 tracing::warn!(issue_id = issue.identifier, "PR creation failed: {e}");
@@ -712,7 +834,7 @@ async fn run_worker(
     }
 
     // Run after_run hook
-    ws.finish(&issue, success).await?;
+    ws.finish(&issue, success, base_branch).await?;
 
     Ok(success)
 }
@@ -907,7 +1029,7 @@ async fn cleanup_terminal(
     }
 }
 
-/// Extract the PR number after creation and register it for review monitoring.
+/// Extract the PR number and branch after creation and register for review monitoring.
 async fn track_created_pr(
     issue: &Issue,
     workspace_dir: &std::path::Path,
@@ -916,22 +1038,28 @@ async fn track_created_pr(
     workflow_id: &str,
     timeout: Duration,
 ) {
-    let script = "gh pr view --json number";
+    let script = "gh pr view --json number,headRefName";
     match workspace_hooks::run_hook_with_output(script, workspace_dir, timeout).await {
         Ok(output) => {
             match serde_json::from_str::<serde_json::Value>(output.trim()) {
                 Ok(data) => {
                     if let Some(number) = data["number"].as_u64() {
+                        let branch_name = data["headRefName"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
                         state.track_pr(
                             state_key,
                             issue.clone(),
                             number,
                             workspace_dir.to_path_buf(),
                             workflow_id,
+                            &branch_name,
                         );
                         tracing::info!(
                             issue_id = issue.identifier,
                             pr = number,
+                            branch = %branch_name,
                             "tracking PR for review monitoring"
                         );
                     } else {
@@ -954,6 +1082,35 @@ async fn track_created_pr(
             tracing::warn!(
                 issue_id = issue.identifier,
                 "failed to get PR info for tracking: {e}"
+            );
+        }
+    }
+}
+
+/// Update a Notion page's status via MCP. Best-effort; logs warnings on failure.
+pub(super) async fn update_notion_status(
+    tracker_config: &crate::config::schema::TrackerConfig,
+    page_id: &str,
+    status_property: &str,
+    status_value: &str,
+) {
+    match NotionTracker::new(tracker_config.clone()).await {
+        Ok(mut tracker) => {
+            if let Err(e) = tracker
+                .update_issue_status(page_id, status_property, status_value)
+                .await
+            {
+                tracing::warn!(
+                    page_id,
+                    status = status_value,
+                    "failed to update Notion status: {e}"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                page_id,
+                "failed to connect to Notion for status update: {e}"
             );
         }
     }

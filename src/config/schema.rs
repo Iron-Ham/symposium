@@ -67,6 +67,14 @@ impl Default for SentryConfig {
     }
 }
 
+fn default_base_branch() -> String {
+    "main".to_string()
+}
+
+fn default_property_parent() -> String {
+    "Parent Task".to_string()
+}
+
 fn default_mcp_type() -> String {
     "stdio".to_string()
 }
@@ -106,6 +114,19 @@ pub struct TrackerConfig {
     pub skip_if_set: Option<String>,
     /// Prefix prepended to the raw ID property value (e.g. "BUG-" → "BUG-316205").
     pub id_prefix: Option<String>,
+    /// Filter to only sub-tasks of a specific epic (parent page ID).
+    pub parent_page_id: Option<String>,
+    /// Notion property name for the parent task relation (default: "Parent Task").
+    #[serde(default = "default_property_parent")]
+    pub property_parent: String,
+    /// Notion property name for the task type (e.g. "Type").
+    pub property_type: Option<String>,
+    /// Only dispatch tasks whose type is in this list (e.g. ["Eng", "Feature"]).
+    pub eligible_types: Option<Vec<String>>,
+    /// Status to set on Notion when a PR is created (e.g. "In Review").
+    pub on_pr_created_status: Option<String>,
+    /// Status to set on Notion when a PR is merged (e.g. "Completed").
+    pub on_pr_merged_status: Option<String>,
 }
 
 impl Default for TrackerConfig {
@@ -126,6 +147,12 @@ impl Default for TrackerConfig {
             assignee_user_id: None,
             skip_if_set: None,
             id_prefix: None,
+            parent_page_id: None,
+            property_parent: default_property_parent(),
+            property_type: None,
+            eligible_types: None,
+            on_pr_created_status: None,
+            on_pr_merged_status: None,
         }
     }
 }
@@ -154,6 +181,10 @@ pub struct WorkspaceConfig {
     pub root: String,
     /// Subdirectory within the workspace to use as the agent's working directory.
     pub agent_subdirectory: Option<String>,
+    /// Default base branch for PRs (default: "main"). Used by epic dispatch
+    /// when tasks have no upstream dependencies or for fan-in tasks.
+    #[serde(default = "default_base_branch")]
+    pub default_branch: String,
 }
 
 impl Default for WorkspaceConfig {
@@ -161,6 +192,7 @@ impl Default for WorkspaceConfig {
         Self {
             root: "~/symposium_workspaces".to_string(),
             agent_subdirectory: None,
+            default_branch: default_base_branch(),
         }
     }
 }

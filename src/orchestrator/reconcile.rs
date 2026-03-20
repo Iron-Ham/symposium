@@ -80,7 +80,7 @@ pub async fn discover_open_prs(state: &OrchestratorState, workflows: &[WorkflowH
             }
 
             // Run gh pr view to check for an open PR
-            let script = "gh pr view --json number,state,title 2>/dev/null";
+            let script = "gh pr view --json number,state,title,headRefName 2>/dev/null";
             let output = match hooks::run_hook_with_output(script, &path, GH_TIMEOUT).await {
                 Ok(o) => o,
                 Err(_) => continue, // no PR on this branch, or gh not available
@@ -120,12 +120,17 @@ pub async fn discover_open_prs(state: &OrchestratorState, workflows: &[WorkflowH
                 workflow_id: wf.id.0.clone(),
             };
 
+            let branch_name = data["headRefName"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
             state.track_pr(
                 &state_key,
                 issue,
                 pr_number,
                 path,
                 &wf.id.0,
+                &branch_name,
             );
             tracing::info!(
                 workflow = %wf.id,

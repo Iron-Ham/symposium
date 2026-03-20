@@ -26,4 +26,19 @@ pub trait TrackerClient {
     async fn fetch_comments(&mut self, _page_id: &str) -> Result<Vec<Comment>> {
         Ok(vec![])
     }
+
+    /// Update the status of an issue in the tracker. Default no-op.
+    async fn update_issue_status(
+        &mut self,
+        _page_id: &str,
+        _status_property: &str,
+        _status_value: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Fetch ALL sub-tasks of an epic regardless of status (for dependency graph).
+    async fn fetch_all_epic_tasks(&mut self) -> Result<Vec<Issue>> {
+        Ok(vec![])
+    }
 }
