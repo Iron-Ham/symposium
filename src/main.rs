@@ -1,10 +1,13 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "symposium", about = "Symphony spec orchestrator for Notion + coding agents")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Paths to WORKFLOW.md files (one per workflow)
     #[arg(default_value = "WORKFLOW.md")]
     workflow_paths: Vec<PathBuf>,
@@ -22,11 +25,29 @@ struct Cli {
     json_logs: bool,
 }
 
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Re-authorize an OAuth-protected MCP server. Purges any cached
+    /// tokens and runs the browser flow. Use this when the refresh
+    /// token has expired (e.g. after a long idle period).
+    Auth {
+        /// MCP server URL (e.g. https://mcp.sentry.dev/mcp)
+        url: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     symposium::logging::init(cli.json_logs);
+
+    if let Some(Command::Auth { url }) = cli.command {
+        let mut oauth = symposium::tracker::oauth::OAuthClient::new(&url);
+        oauth.reauthorize().await?;
+        println!("Authorized {url}. Cached tokens saved. Restart the orchestrator to pick them up.");
+        return Ok(());
+    }
 
     // Canonicalize workflow paths
     let workflow_paths: Vec<PathBuf> = cli

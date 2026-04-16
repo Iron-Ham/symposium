@@ -79,6 +79,90 @@ impl OAuthClient {
         }
     }
 
+    /// Purge any cached tokens and client registration from memory and disk,
+    /// then run the full interactive OAuth authorization flow (opens a
+    /// browser). Intended for one-shot CLI use to recover from a revoked or
+    /// expired refresh token — the daemon must never call this, since the
+    /// browser flow would block the tick loop.
+    pub async fn reauthorize(&mut self) -> Result<String> {
+        self.cache = None;
+        match tokio::fs::remove_file(&self.cache_path).await {
+            Ok(_) => {
+                tracing::info!(path = %self.cache_path.display(), "purged oauth cache");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Mcp(format!(
+                    "failed to purge oauth cache at {}: {e}",
+                    self.cache_path.display()
+                )));
+            }
+        }
+        self.get_token().await
+    }
+
+    /// Force a refresh using the cached refresh_token, bypassing the local
+    /// `expires_at` check. Intended for recovery after the server returns 401
+    /// on a token that the client still considered valid (e.g. server-side
+    /// rotation or revocation).
+    ///
+    /// Returns an error if there is no cached refresh token, or if the refresh
+    /// request itself fails — callers in daemon contexts should surface this
+    /// so the user can re-authorize out of band rather than blocking a request
+    /// path on the interactive browser flow.
+    pub async fn force_refresh(&mut self) -> Result<String> {
+        if self.cache.is_none() {
+            self.cache = self.load_cache().await;
+        }
+
+        let (client, refresh) = {
+            let cache = self.cache.as_ref().ok_or_else(|| {
+                Error::Mcp("no OAuth cache on disk; re-authorize out of band".into())
+            })?;
+            let tokens = cache.tokens.as_ref().ok_or_else(|| {
+                Error::Mcp("no cached tokens; re-authorize out of band".into())
+            })?;
+            let refresh = tokens.refresh_token.clone().ok_or_else(|| {
+                Error::Mcp("no refresh token available; re-authorize out of band".into())
+            })?;
+            (
+                ClientRegistration {
+                    client_id: cache.client.client_id.clone(),
+                    client_secret: cache.client.client_secret.clone(),
+                },
+                refresh,
+            )
+        };
+
+        match self.refresh_token(&client, &refresh).await {
+            Ok(new_tokens) => {
+                let access = new_tokens.access_token.clone();
+                self.cache.as_mut().unwrap().tokens = Some(new_tokens);
+                self.save_cache().await?;
+                Ok(access)
+            }
+            Err(e) if is_invalid_grant(&e) => {
+                // Refresh token is revoked or expired server-side (typical
+                // after a long idle period). Purge the stale cache and fall
+                // through to the interactive authorize flow — this opens a
+                // browser and blocks the caller for up to ~120s while the
+                // user completes consent, but it's the only way to recover
+                // without manual intervention.
+                tracing::warn!(
+                    "refresh token rejected ({e}); launching interactive re-authorization"
+                );
+                self.cache = None;
+                if let Err(err) = tokio::fs::remove_file(&self.cache_path).await
+                    && err.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!("failed to purge stale oauth cache: {err}");
+                }
+                self.get_token().await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Get a valid access token, refreshing or re-authorizing as needed.
     pub async fn get_token(&mut self) -> Result<String> {
         // Load cache from disk if we haven't yet
@@ -421,6 +505,16 @@ async fn wait_for_callback(
     let _ = stream.write_all(response.as_bytes()).await;
 
     Ok(code)
+}
+
+/// Heuristic: does this error come from the token endpoint rejecting the
+/// refresh grant as revoked/expired? We can't pattern-match on structured
+/// fields because `refresh_token` folds the body into a string, but the
+/// OAuth 2.0 spec (RFC 6749 §5.2) mandates the `"error": "invalid_grant"`
+/// code for this condition, and every server we've seen returns it verbatim.
+fn is_invalid_grant(err: &Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("invalid_grant")
 }
 
 fn generate_random_string(len: usize) -> String {
