@@ -91,9 +91,14 @@ impl HttpMcpClient {
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            // Token might be stale — force re-auth and retry once
-            tracing::info!("MCP returned 401, re-authenticating...");
-            self.oauth = OAuthClient::new(&self.url);
+            // The server rejected our cached access_token even though its
+            // local TTL had not elapsed — most commonly because the token was
+            // rotated or revoked server-side. Force a refresh using the
+            // stored refresh_token and retry once. If refresh isn't possible
+            // we propagate the error rather than falling back to the
+            // interactive browser flow, which would block the tick loop.
+            tracing::info!("MCP returned 401, refreshing access token...");
+            self.oauth.force_refresh().await?;
             let response = self.post_json(&body).await?;
             return self.parse_response(response, id).await;
         }
