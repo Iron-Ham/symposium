@@ -167,7 +167,109 @@ pub async fn run_workflow_tick(
         .await;
     }
 
+    // 9. Age-based workspace reaper (disabled unless workspace.max_age_days is set).
+    //    Catches orphaned workspaces whose issue never reached a terminal state
+    //    (e.g. Notion row deleted, workflow removed, PR already merged and closed).
+    if let Some(max_age) = config.workspace.max_age() {
+        reap_stale_workspaces(max_age, state, &workflow.config_rx, wf_id);
+    }
+
     Ok(())
+}
+
+/// Pure selection logic for the reaper — given the candidate directory names,
+/// the skip set (sanitized names of running issues + tracked open PRs), the
+/// "now" reference, a resolver that returns each workspace's mtime, and the
+/// age threshold, return the subset that should be deleted.
+///
+/// Split out so we can test the decision table without touching the real
+/// filesystem or a live orchestrator.
+fn select_reap_candidates<F>(
+    workspaces: &[String],
+    skip: &std::collections::HashSet<String>,
+    now: std::time::SystemTime,
+    max_age: Duration,
+    mut mtime_of: F,
+) -> Vec<String>
+where
+    F: FnMut(&str) -> Option<std::time::SystemTime>,
+{
+    workspaces
+        .iter()
+        .filter(|name| !skip.contains(name.as_str()))
+        .filter(|name| match mtime_of(name) {
+            Some(t) => now.duration_since(t).map(|age| age >= max_age).unwrap_or(false),
+            None => false,
+        })
+        .cloned()
+        .collect()
+}
+
+fn reap_skip_set(
+    state: &OrchestratorState,
+    workflow_id: &WorkflowId,
+) -> std::collections::HashSet<String> {
+    use crate::workspace::safety::sanitize_key;
+    let mut skip: std::collections::HashSet<String> = state
+        .running_issue_ids_for_workflow(&workflow_id.0)
+        .into_iter()
+        .map(|id| sanitize_key(&id))
+        .collect();
+    skip.extend(
+        state
+            .open_prs()
+            .iter()
+            .map(|pr| sanitize_key(&pr.issue.identifier)),
+    );
+    skip
+}
+
+/// Delete workspaces whose top-level mtime is older than `max_age`, skipping
+/// anything currently running or backing a tracked open PR. Runs asynchronously
+/// — tick loop keeps moving.
+fn reap_stale_workspaces(
+    max_age: Duration,
+    state: &OrchestratorState,
+    config_rx: &watch::Receiver<ServiceConfig>,
+    workflow_id: &WorkflowId,
+) {
+    let ws = WorkspaceManager::new(config_rx.clone());
+    let workspaces = match ws.list_workspaces() {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::warn!(workflow = %workflow_id, "reaper: failed to list workspaces: {e}");
+            return;
+        }
+    };
+    if workspaces.is_empty() {
+        return;
+    }
+
+    let skip = reap_skip_set(state, workflow_id);
+    let root = std::path::PathBuf::from(&config_rx.borrow().workspace.root);
+    let wf_id = workflow_id.clone();
+    tokio::spawn(async move {
+        let now = std::time::SystemTime::now();
+        let targets = select_reap_candidates(&workspaces, &skip, now, max_age, |name| {
+            std::fs::metadata(root.join(name))
+                .ok()
+                .and_then(|m| m.modified().ok())
+        });
+        for name in targets {
+            tracing::info!(
+                workflow = %wf_id,
+                workspace = %name,
+                "reaping stale workspace"
+            );
+            if let Err(e) = ws.remove(&name).await {
+                tracing::warn!(
+                    workflow = %wf_id,
+                    workspace = %name,
+                    "reaper: failed to remove workspace: {e}"
+                );
+            }
+        }
+    });
 }
 
 /// Spawn a worker task for a new issue.
@@ -969,5 +1071,68 @@ async fn cleanup_terminal_sentry(
     match tracker.fetch_terminal_issues().await {
         Ok(issues) => remove_terminal_workspaces(issues, state, config_rx, workflow_id),
         Err(e) => tracing::warn!(workflow = %workflow_id, "failed to fetch terminal Sentry issues for cleanup: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod reaper_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::time::{Duration, SystemTime};
+
+    fn s(x: &str) -> String {
+        x.to_string()
+    }
+
+    #[test]
+    fn reaps_only_stale_unskipped() {
+        let workspaces = vec![s("OLD"), s("FRESH"), s("SKIP")];
+        let skip: HashSet<String> = [s("SKIP")].into();
+        let now = SystemTime::now();
+        let max_age = Duration::from_secs(7 * 24 * 3600);
+
+        let ages: std::collections::HashMap<&str, SystemTime> = [
+            ("OLD", now - Duration::from_secs(30 * 24 * 3600)),
+            ("FRESH", now - Duration::from_secs(3600)),
+            ("SKIP", now - Duration::from_secs(60 * 24 * 3600)),
+        ]
+        .into();
+
+        let out = select_reap_candidates(&workspaces, &skip, now, max_age, |n| {
+            ages.get(n).copied()
+        });
+        assert_eq!(out, vec![s("OLD")]);
+    }
+
+    #[test]
+    fn skips_missing_mtime() {
+        let workspaces = vec![s("NO_METADATA")];
+        let skip = HashSet::new();
+        let now = SystemTime::now();
+        let out = select_reap_candidates(
+            &workspaces,
+            &skip,
+            now,
+            Duration::from_secs(60),
+            |_| None,
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn skips_future_mtime() {
+        // A workspace with mtime in the future (clock skew) should not be reaped.
+        let workspaces = vec![s("FUTURE")];
+        let skip = HashSet::new();
+        let now = SystemTime::now();
+        let future = now + Duration::from_secs(3600);
+        let out = select_reap_candidates(
+            &workspaces,
+            &skip,
+            now,
+            Duration::from_secs(60),
+            |_| Some(future),
+        );
+        assert!(out.is_empty());
     }
 }

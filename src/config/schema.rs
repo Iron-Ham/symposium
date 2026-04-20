@@ -154,6 +154,10 @@ pub struct WorkspaceConfig {
     pub root: String,
     /// Subdirectory within the workspace to use as the agent's working directory.
     pub agent_subdirectory: Option<String>,
+    /// Reap workspaces whose top-level mtime is older than this many days.
+    /// Running sessions and workspaces with tracked open PRs are always skipped.
+    /// `None` disables the reaper.
+    pub max_age_days: Option<u64>,
 }
 
 impl Default for WorkspaceConfig {
@@ -161,7 +165,15 @@ impl Default for WorkspaceConfig {
         Self {
             root: "~/symposium_workspaces".to_string(),
             agent_subdirectory: None,
+            max_age_days: None,
         }
+    }
+}
+
+impl WorkspaceConfig {
+    pub fn max_age(&self) -> Option<Duration> {
+        self.max_age_days
+            .map(|d| Duration::from_secs(d * 24 * 60 * 60))
     }
 }
 
@@ -171,6 +183,12 @@ pub struct HooksConfig {
     pub after_create: Option<String>,
     pub before_run: Option<String>,
     pub after_run: Option<String>,
+    /// Optional shell hook rendered and run from the workspace's parent
+    /// directory before the workspace itself is deleted. Typical use:
+    /// `git -C <repo> worktree remove --force {{ workspace }}` so worktree
+    /// metadata is pruned along with the files. If the hook fails we still
+    /// fall back to `remove_dir_all` so disk is always reclaimed.
+    pub before_remove: Option<String>,
     pub timeout_ms: u64,
 }
 
@@ -180,6 +198,7 @@ impl Default for HooksConfig {
             after_create: None,
             before_run: None,
             after_run: None,
+            before_remove: None,
             timeout_ms: 300_000,
         }
     }

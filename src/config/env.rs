@@ -47,6 +47,9 @@ pub fn expand_config(config: &mut ServiceConfig) {
     if let Some(ref s) = config.hooks.after_run {
         config.hooks.after_run = Some(expand_vars(s));
     }
+    if let Some(ref s) = config.hooks.before_remove {
+        config.hooks.before_remove = Some(expand_vars(s));
+    }
 
     config.sentry.org = expand_vars(&config.sentry.org);
     config.sentry.project = expand_vars(&config.sentry.project);
