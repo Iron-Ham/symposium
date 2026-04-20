@@ -231,6 +231,18 @@ impl OrchestratorState {
             .count()
     }
 
+    /// Issue identifiers currently running under the given workflow.
+    pub fn running_issue_ids_for_workflow(&self, workflow_id: &str) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .running
+            .values()
+            .filter(|e| e.workflow_id == workflow_id)
+            .map(|e| e.issue.identifier.clone())
+            .collect()
+    }
+
     pub fn start_session(&self, state_key: &str, issue: Issue, stall_timeout: Duration, workflow_id: &str) {
         let session = LiveSession::new(state_key.to_string());
         let entry = RunningEntry {
