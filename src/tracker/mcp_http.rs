@@ -71,6 +71,13 @@ impl HttpMcpClient {
         .await
     }
 
+    /// List the tools advertised by the MCP server, including their input schemas.
+    /// Useful for probing/diagnostics; the regular orchestrator only needs the
+    /// names, which `initialize` already logs.
+    pub async fn list_tools(&mut self) -> Result<Value> {
+        self.send_request("tools/list", serde_json::json!({})).await
+    }
+
     async fn send_request(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let body = serde_json::json!({

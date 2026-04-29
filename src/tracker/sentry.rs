@@ -18,26 +18,37 @@ impl SentryTracker {
         Ok(Self { config, client })
     }
 
-    /// Build the full Sentry search string.
+    /// Build the filter portion of the Sentry search query.
     ///
-    /// Combines `is:unresolved`/`is:resolved`, `project:<slug>`,
-    /// and the user-supplied `query` from config.
+    /// Combines `is:unresolved`/`is:resolved` with the user-supplied `query`
+    /// from config. The project filter is passed structurally via the
+    /// `projectSlugOrId` argument, NOT inside this string — Sentry's MCP
+    /// server uses a strict JSON schema and a `project:<slug>` token inside
+    /// the freeform `query` is honored only as a soft hint by its NL parser.
     fn build_query(&self, resolved: bool) -> String {
         let status = if resolved { "is:resolved" } else { "is:unresolved" };
-        let project = &self.config.project;
         let extra = &self.config.query;
 
         if extra.is_empty() {
-            format!("project:{project} {status}")
+            status.to_string()
         } else {
-            format!("project:{project} {status} {extra}")
+            format!("{status} {extra}")
         }
     }
 
+    /// Maximum issues to fetch per `search_issues` call. Sentry's MCP schema
+    /// caps `limit` at 100; we always ask for the max so a noisy project
+    /// can't push real targets off the end of a default-10 page.
+    const SEARCH_LIMIT: u64 = 100;
+
     /// Call the `search_issues` MCP tool and parse the markdown response into Issues.
     async fn fetch_issues(&mut self, resolved: bool) -> Result<Vec<Issue>> {
-        let nl_query = self.build_query(resolved);
-        tracing::info!(query = %nl_query, "Sentry MCP query");
+        let query = self.build_query(resolved);
+        tracing::info!(
+            project = %self.config.project,
+            query = %query,
+            "Sentry MCP query",
+        );
 
         let result = self
             .client
@@ -45,7 +56,9 @@ impl SentryTracker {
                 "search_issues",
                 serde_json::json!({
                     "organizationSlug": self.config.org,
-                    "naturalLanguageQuery": nl_query,
+                    "projectSlugOrId": self.config.project,
+                    "query": query,
+                    "limit": Self::SEARCH_LIMIT,
                 }),
             )
             .await?;
@@ -79,6 +92,14 @@ impl SentryTracker {
         // get_issue_details returns a single issue with similar formatting
         let issues = self.parse_issue_list(&text);
         Ok(issues.into_iter().next())
+    }
+
+    /// Expected short-ID prefix for issues belonging to the configured project.
+    /// Sentry generates short IDs as `<PROJECT_SLUG_UPPER>-<HASH>`, so we can
+    /// derive this deterministically and use it as a defense-in-depth filter
+    /// against any future MCP server-side scoping regression.
+    fn expected_short_id_prefix(&self) -> String {
+        format!("{}-", self.config.project.to_ascii_uppercase())
     }
 
     /// Extract the text content from an MCP tool response.
@@ -116,6 +137,7 @@ impl SentryTracker {
     /// ```
     fn parse_issue_list(&self, text: &str) -> Vec<Issue> {
         let mut issues = Vec::new();
+        let expected_prefix = self.expected_short_id_prefix();
 
         // Match issue header: ## N. [SHORT-ID](url)
         let header_re =
@@ -141,6 +163,20 @@ impl SentryTracker {
             if let Some(caps) = header_re.captures(section) {
                 let short_id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 let url = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+
+                // Defense-in-depth: even though `projectSlugOrId` is now passed
+                // structurally, drop any issue whose short ID prefix doesn't
+                // match the configured project. Catches both server-side
+                // regressions and the `get_issue_details` path returning an
+                // unexpected project.
+                if !expected_prefix.is_empty() && !short_id.starts_with(&expected_prefix) {
+                    tracing::warn!(
+                        short_id,
+                        expected_prefix,
+                        "Sentry response contained an issue outside the configured project; skipping",
+                    );
+                    continue;
+                }
 
                 let title = Self::extract_bold_line(section);
                 let status = Self::extract_field(section, "Status").unwrap_or_default();
@@ -374,16 +410,18 @@ Found **2** issues:
             ..SentryConfig::default()
         };
 
+        // Project is passed structurally via `projectSlugOrId`, so it must NOT
+        // appear in the query string.
         let query = build_query_standalone(&config, false);
         assert_eq!(
             query,
-            "project:mail-ios is:unresolved release:[so.notion.Mail@1.7.*,so.notion.Mail@1.8.*]"
+            "is:unresolved release:[so.notion.Mail@1.7.*,so.notion.Mail@1.8.*]"
         );
 
         let query = build_query_standalone(&config, true);
         assert_eq!(
             query,
-            "project:mail-ios is:resolved release:[so.notion.Mail@1.7.*,so.notion.Mail@1.8.*]"
+            "is:resolved release:[so.notion.Mail@1.7.*,so.notion.Mail@1.8.*]"
         );
     }
 
@@ -395,7 +433,88 @@ Found **2** issues:
         };
 
         let query = build_query_standalone(&config, false);
-        assert_eq!(query, "project:my-project is:unresolved");
+        assert_eq!(query, "is:unresolved");
+    }
+
+    #[test]
+    fn parse_filters_out_other_projects() {
+        let config = SentryConfig {
+            project: "mail-ios".to_string(),
+            min_events: 1,
+            ..SentryConfig::default()
+        };
+
+        // Mixed response with a mail-ios issue and a mail-web issue. Only the
+        // mail-ios one should survive the client-side prefix guard.
+        let text = r#"## 1. [MAIL-IOS-1A3](https://notion.sentry.io/issues/MAIL-IOS-1A3/)
+
+**iOS crash**
+
+- **Status**: unresolved
+- **Users**: 5
+- **Events**: 42
+- **First seen**: 3 days ago
+- **Last seen**: 2 hours ago
+
+## 2. [MAIL-WEB-9F2](https://notion.sentry.io/issues/MAIL-WEB-9F2/)
+
+**Web crash that should be dropped**
+
+- **Status**: unresolved
+- **Users**: 50
+- **Events**: 500
+- **First seen**: 1 day ago
+- **Last seen**: 30 minutes ago
+
+## 3. [WEBCLIENT-7C1](https://notion.sentry.io/issues/WEBCLIENT-7C1/)
+
+**Other project crash that should be dropped**
+
+- **Status**: unresolved
+- **Users**: 10
+- **Events**: 100
+- **First seen**: 1 day ago
+- **Last seen**: 1 hour ago
+"#;
+
+        let issues = parse_issue_list_standalone(&config, text);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].identifier, "sentry:MAIL-IOS-1A3");
+    }
+
+    #[test]
+    fn parse_keeps_everything_when_project_unset() {
+        // Empty project (e.g. tests with default config) means no client-side
+        // filter — preserves prior behavior.
+        let config = SentryConfig {
+            project: String::new(),
+            min_events: 1,
+            ..SentryConfig::default()
+        };
+
+        let text = r#"## 1. [MAIL-IOS-1A3](https://x/MAIL-IOS-1A3/)
+
+**A**
+
+- **Status**: unresolved
+- **Users**: 1
+- **Events**: 1
+- **First seen**: x
+- **Last seen**: y
+
+## 2. [MAIL-WEB-9F2](https://x/MAIL-WEB-9F2/)
+
+**B**
+
+- **Status**: unresolved
+- **Users**: 1
+- **Events**: 1
+- **First seen**: x
+- **Last seen**: y
+"#;
+
+        let issues = parse_issue_list_standalone(&config, text);
+        assert_eq!(issues.len(), 2);
     }
 
     #[test]
@@ -427,6 +546,11 @@ Found **2** issues:
         // Replicate the parsing logic using SentryTracker's static/instance methods.
         // We construct a minimal "tracker" by calling the parse methods directly.
         let mut issues = Vec::new();
+        let expected_prefix = if config.project.is_empty() {
+            String::new()
+        } else {
+            format!("{}-", config.project.to_ascii_uppercase())
+        };
         let header_re = Regex::new(r"##\s+\d+\.\s+\[([^\]]+)\]\(([^)]+)\)").unwrap();
 
         let sections: Vec<(regex::Match, &str)> = {
@@ -448,6 +572,11 @@ Found **2** issues:
             if let Some(caps) = header_re.captures(section) {
                 let short_id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                 let url = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+
+                if !expected_prefix.is_empty() && !short_id.starts_with(&expected_prefix) {
+                    continue;
+                }
+
                 let title = SentryTracker::extract_bold_line(section);
                 let status =
                     SentryTracker::extract_field(section, "Status").unwrap_or_default();
@@ -512,13 +641,12 @@ Found **2** issues:
     /// Standalone helper to test build_query without an MCP connection.
     fn build_query_standalone(config: &SentryConfig, resolved: bool) -> String {
         let status = if resolved { "is:resolved" } else { "is:unresolved" };
-        let project = &config.project;
         let extra = &config.query;
 
         if extra.is_empty() {
-            format!("project:{project} {status}")
+            status.to_string()
         } else {
-            format!("project:{project} {status} {extra}")
+            format!("{status} {extra}")
         }
     }
 }

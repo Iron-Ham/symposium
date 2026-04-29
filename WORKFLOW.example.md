@@ -119,9 +119,16 @@ server:
 # sentry:
 #   enabled: true
 #   org: "my-org"
+#   # Passed to Sentry's MCP server as `projectSlugOrId` for hard server-side
+#   # scoping; also used to derive an expected short-id prefix (e.g. `MY-PROJECT-`)
+#   # for a defense-in-depth client-side filter.
 #   project: "my-project"
 #   mcp_url: "https://mcp.sentry.dev/mcp"  # Sentry MCP server (OAuth auth)
-#   query: "release:[my-app@1.7.*,my-app@1.8.*]"  # Sentry search syntax
+#   # Extra Sentry search filters appended after `is:unresolved` / `is:resolved`.
+#   # Do NOT include `project:<slug>` here — the project is passed structurally
+#   # above. Putting it in this string lets Sentry's NL parser treat the project
+#   # as a soft hint, and unrelated projects can leak through.
+#   query: "release:[my-app@1.7.*,my-app@1.8.*]"
 #   min_events: 5                           # skip issues below this threshold
 #   id_prefix: "SENTRY:"                    # default: "sentry:" — prefix for Sentry issue IDs
 
