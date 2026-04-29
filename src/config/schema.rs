@@ -38,9 +38,13 @@ pub struct SentryConfig {
     /// MCP server URL for Sentry (uses OAuth for auth).
     #[serde(default = "default_sentry_mcp_url")]
     pub mcp_url: String,
-    /// Raw Sentry search query appended after `is:unresolved project:<project>`.
-    /// Use Sentry search syntax directly, e.g.:
-    /// `"release:[so.notion.Mail@1.7.*,so.notion.Mail@1.8.*]"`
+    /// Extra Sentry search filters appended after `is:unresolved` (or
+    /// `is:resolved`). The project filter is passed structurally via the MCP
+    /// `projectSlugOrId` argument — do NOT include `project:<slug>` here, the
+    /// Sentry MCP server's natural-language parser treats it as a soft hint
+    /// only and will let issues from other projects leak through.
+    /// Example: `"error.unhandled:true"` or
+    /// `"release:[so.notion.Mail@1.7.*,so.notion.Mail@1.8.*]"`.
     pub query: String,
     #[serde(default = "default_sentry_min_events")]
     pub min_events: u64,
