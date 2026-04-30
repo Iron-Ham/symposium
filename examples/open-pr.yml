@@ -1,0 +1,89 @@
+# Symposium PR opener.
+#
+# Drop this file into your target repo at `.github/workflows/open-pr.yml`,
+# then point Symposium at it from your WORKFLOW.<name>.md:
+#
+#   pr_creation:
+#     workflow: open-pr.yml
+#
+# When Symposium finishes an agent attempt, it pushes the branch and triggers
+# this workflow via `gh workflow run`. The workflow opens the PR using the
+# default `GITHUB_TOKEN`, so the PR is authored by `github-actions[bot]`
+# instead of the user whose credentials Symposium itself runs under. This
+# decouples PR ownership from Symposium's own account so review notifications
+# can be routed via CODEOWNERS independent of who's running the orchestrator.
+#
+# Caveat: PRs opened with the default GITHUB_TOKEN do NOT trigger downstream
+# workflow runs (no recursive CI). If your repo needs CI to run on these PRs,
+# replace `${{ secrets.GITHUB_TOKEN }}` below with a PAT or GitHub App token
+# that has `pull_requests:write` and is exempt from the recursion guard.
+
+name: open-pr
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Source branch to open the PR from"
+        required: true
+        type: string
+      title:
+        description: "PR title"
+        required: true
+        type: string
+      body:
+        description: "PR body (markdown)"
+        required: true
+        type: string
+      base:
+        description: "Base branch to merge into"
+        required: false
+        default: "main"
+        type: string
+      draft:
+        description: "Open as a draft"
+        required: false
+        default: "true"
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+
+      - name: Open PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_TITLE: ${{ inputs.title }}
+          PR_BODY: ${{ inputs.body }}
+          PR_BASE: ${{ inputs.base }}
+          PR_HEAD: ${{ inputs.branch }}
+          PR_DRAFT: ${{ inputs.draft }}
+        run: |
+          set -euo pipefail
+
+          existing=$(gh pr list --head "$PR_HEAD" --state open --json number --jq '.[0].number' || true)
+          if [ -n "${existing:-}" ]; then
+            echo "PR #$existing is already open for $PR_HEAD; nothing to do."
+            exit 0
+          fi
+
+          args=(
+            --base  "$PR_BASE"
+            --head  "$PR_HEAD"
+            --title "$PR_TITLE"
+            --body  "$PR_BODY"
+          )
+          if [ "$PR_DRAFT" = "true" ]; then
+            args+=( --draft )
+          fi
+
+          gh pr create "${args[@]}"

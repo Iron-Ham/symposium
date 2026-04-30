@@ -177,6 +177,28 @@ review:
 #   # prompt_template: |
 #   #   Address reviewer feedback on PR #{{ issue.extra.pr_number }} for {{ issue.identifier }}.
 #   #   Run `gh pr view {{ issue.extra.pr_number }} --comments` to see feedback.
+
+# Optional: open PRs by triggering a workflow_dispatch GitHub Action in the
+# target repo instead of calling `gh pr create` directly. When set, Symposium
+# pushes the branch and runs `gh workflow run <workflow>` with the title and
+# body as inputs. The Action opens the PR using GITHUB_TOKEN, so it appears
+# authored by `github-actions[bot]` instead of the user Symposium is running
+# under — useful when one human's account would otherwise own every PR and
+# concentrate the review load on the same teammates.
+#
+# An example workflow you can drop into `.github/workflows/open-pr.yml` of your
+# target repo lives at `examples/open-pr.yml` in the symposium repo.
+#
+# Caveat: PRs opened with the default GITHUB_TOKEN do NOT trigger downstream
+# workflow runs (no recursive CI). If your repo needs CI on these PRs, swap in
+# a PAT or GitHub App token inside the workflow itself.
+# pr_creation:
+#   workflow: open-pr.yml          # filename of the workflow_dispatch action in the target repo
+#   branch_input: branch            # workflow input that receives the source branch
+#   title_input: title              # workflow input that receives the PR title
+#   body_input: body                # workflow input that receives the PR body (markdown)
+#   poll_timeout_ms: 120000         # max time to wait for the workflow to open the PR
+#   poll_interval_ms: 3000          # interval between PR-poll attempts
 ---
 ```
 

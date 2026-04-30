@@ -297,4 +297,54 @@ Prompt here."#;
         assert!(config.pr_review.enabled);
         assert!(config.pr_review.prompt_template.contains("{{ issue.pr_number }}"));
     }
+
+    #[test]
+    fn parse_pr_creation_config_defaults() {
+        let content = "---\n---\nPrompt here.";
+        let (config, _) = parse_workflow(content).unwrap();
+        assert!(!config.pr_creation.is_workflow_dispatch());
+        assert_eq!(config.pr_creation.branch_input, "branch");
+        assert_eq!(config.pr_creation.title_input, "title");
+        assert_eq!(config.pr_creation.body_input, "body");
+        assert_eq!(config.pr_creation.poll_timeout_ms, 120_000);
+        assert_eq!(config.pr_creation.poll_interval_ms, 3_000);
+    }
+
+    #[test]
+    fn parse_pr_creation_config_workflow_dispatch() {
+        let content = r#"---
+pr_creation:
+  workflow: open-pr.yml
+  poll_timeout_ms: 60000
+  poll_interval_ms: 5000
+---
+Prompt here."#;
+        let (config, _) = parse_workflow(content).unwrap();
+        assert!(config.pr_creation.is_workflow_dispatch());
+        assert_eq!(config.pr_creation.workflow, "open-pr.yml");
+        // Unspecified input names retain their defaults.
+        assert_eq!(config.pr_creation.branch_input, "branch");
+        assert_eq!(config.pr_creation.title_input, "title");
+        assert_eq!(config.pr_creation.body_input, "body");
+        assert_eq!(config.pr_creation.poll_timeout_ms, 60_000);
+        assert_eq!(config.pr_creation.poll_interval_ms, 5_000);
+    }
+
+    #[test]
+    fn parse_pr_creation_config_custom_input_names() {
+        let content = r#"---
+pr_creation:
+  workflow: ".github/workflows/dispatch-pr.yml"
+  branch_input: head_ref
+  title_input: pr_title
+  body_input: pr_body
+---
+Prompt here."#;
+        let (config, _) = parse_workflow(content).unwrap();
+        assert!(config.pr_creation.is_workflow_dispatch());
+        assert_eq!(config.pr_creation.workflow, ".github/workflows/dispatch-pr.yml");
+        assert_eq!(config.pr_creation.branch_input, "head_ref");
+        assert_eq!(config.pr_creation.title_input, "pr_title");
+        assert_eq!(config.pr_creation.body_input, "pr_body");
+    }
 }
