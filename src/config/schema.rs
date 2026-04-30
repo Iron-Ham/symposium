@@ -16,6 +16,7 @@ pub struct ServiceConfig {
     pub preflight: PreflightConfig,
     pub review: ReviewConfig,
     pub pr_review: PrReviewConfig,
+    pub pr_creation: PrCreationConfig,
     pub mcp_servers: HashMap<String, McpServerConfig>,
     pub sentry: SentryConfig,
     pub prompt_template: String,
@@ -372,5 +373,70 @@ impl Default for PrReviewConfig {
             prompt_template: String::new(),
             reviewers: ReviewerFilter::All,
         }
+    }
+}
+
+/// How Symposium should open the PR after the agent commits its work.
+///
+/// By default Symposium calls `gh pr create --draft` directly. That uses the
+/// token Symposium itself was authenticated with, so the PR is authored by
+/// that user and review notifications go to whoever GitHub picks from CODEOWNERS
+/// for that user. In setups where Symposium runs as a single human's account,
+/// every PR concentrates review workload on the same handful of teammates.
+///
+/// Setting `workflow` switches to a `workflow_dispatch` flow: Symposium pushes
+/// the branch and triggers the named GitHub Action in the target repo, passing
+/// the title and body as inputs. The Action opens the PR using `GITHUB_TOKEN`,
+/// so it appears authored by `github-actions[bot]` and review can be routed via
+/// CODEOWNERS independent of whoever is running Symposium.
+///
+/// Caveat: PRs opened with `GITHUB_TOKEN` do not trigger downstream workflow
+/// runs (no recursive CI). Repos that need CI on bot-opened PRs should use a
+/// PAT or a GitHub App token inside the workflow itself.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PrCreationConfig {
+    /// Filename (or path) of the workflow_dispatch GitHub Action in the target
+    /// repo that opens the PR (e.g. "open-pr.yml"). When empty, Symposium falls
+    /// back to running `gh pr create --draft` directly.
+    pub workflow: String,
+    /// Name of the workflow input that receives the source branch.
+    pub branch_input: String,
+    /// Name of the workflow input that receives the PR title.
+    pub title_input: String,
+    /// Name of the workflow input that receives the PR body.
+    pub body_input: String,
+    /// Maximum time to wait for the workflow to open the PR before giving up.
+    /// Specified in milliseconds. The branch is polled with `gh pr list --head`.
+    pub poll_timeout_ms: u64,
+    /// Interval between PR-poll attempts, in milliseconds.
+    pub poll_interval_ms: u64,
+}
+
+impl Default for PrCreationConfig {
+    fn default() -> Self {
+        Self {
+            workflow: String::new(),
+            branch_input: "branch".to_string(),
+            title_input: "title".to_string(),
+            body_input: "body".to_string(),
+            poll_timeout_ms: 120_000,
+            poll_interval_ms: 3_000,
+        }
+    }
+}
+
+impl PrCreationConfig {
+    /// True when a workflow_dispatch PR-creation flow has been configured.
+    pub fn is_workflow_dispatch(&self) -> bool {
+        !self.workflow.is_empty()
+    }
+
+    pub fn poll_timeout(&self) -> Duration {
+        Duration::from_millis(self.poll_timeout_ms)
+    }
+
+    pub fn poll_interval(&self) -> Duration {
+        Duration::from_millis(self.poll_interval_ms)
     }
 }

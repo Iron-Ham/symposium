@@ -760,22 +760,16 @@ async fn run_worker(
         let (pr_title, pr_body_text) =
             read_pr_metadata(&workspace_dir, &issue).await;
 
-        // Write title/body to temp files outside the workspace to avoid accidental git add
-        let tmp = std::env::temp_dir();
-        let title_file = tmp.join(format!("symposium-pr-title-{}", issue.identifier));
-        let body_file = tmp.join(format!("symposium-pr-body-{}", issue.identifier));
-        if let Err(e) = tokio::fs::write(&title_file, &pr_title).await {
-            tracing::warn!(path = %title_file.display(), "failed to write PR title temp file: {e}");
-        }
-        if let Err(e) = tokio::fs::write(&body_file, &pr_body_text).await {
-            tracing::warn!(path = %body_file.display(), "failed to write PR body temp file: {e}");
-        }
-        let pr_script = format!(
-            "git push -u origin HEAD 2>&1 && gh pr create --draft --title \"$(cat {})\" --body-file {} 2>&1",
-            title_file.display(),
-            body_file.display(),
-        );
-        match hooks::run_hook(&pr_script, &workspace_dir, hook_timeout).await {
+        match open_pr(
+            &issue,
+            &workspace_dir,
+            &config.pr_creation,
+            &pr_title,
+            &pr_body_text,
+            hook_timeout,
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::info!(issue_id = issue.identifier, "draft PR created");
                 state.push_agent_event(
@@ -808,15 +802,145 @@ async fn run_worker(
                 );
             }
         }
-        // Clean up temp files
-        let _ = tokio::fs::remove_file(&title_file).await;
-        let _ = tokio::fs::remove_file(&body_file).await;
     }
 
     // Run after_run hook
     ws.finish(&issue, success).await?;
 
     Ok(success)
+}
+
+/// Push the branch and open a draft PR for the agent's work.
+///
+/// When `pr_creation.workflow` is configured, this triggers a `workflow_dispatch`
+/// GitHub Action in the target repo (passing the title and body as inputs) so the
+/// PR is opened by `github-actions[bot]` and review notifications can be routed
+/// independently of whoever Symposium is authenticated as. Otherwise, falls back
+/// to running `gh pr create --draft` directly with Symposium's own credentials.
+async fn open_pr(
+    issue: &Issue,
+    workspace_dir: &std::path::Path,
+    pr_creation: &crate::config::schema::PrCreationConfig,
+    pr_title: &str,
+    pr_body: &str,
+    hook_timeout: Duration,
+) -> std::result::Result<(), String> {
+    use crate::workspace::hooks as ws_hooks;
+
+    // Write title/body to temp files outside the workspace to avoid accidental git add.
+    let tmp = std::env::temp_dir();
+    let title_file = tmp.join(format!("symposium-pr-title-{}", issue.identifier));
+    let body_file = tmp.join(format!("symposium-pr-body-{}", issue.identifier));
+    if let Err(e) = tokio::fs::write(&title_file, pr_title).await {
+        tracing::warn!(path = %title_file.display(), "failed to write PR title temp file: {e}");
+    }
+    if let Err(e) = tokio::fs::write(&body_file, pr_body).await {
+        tracing::warn!(path = %body_file.display(), "failed to write PR body temp file: {e}");
+    }
+
+    let result = if pr_creation.is_workflow_dispatch() {
+        open_pr_via_workflow_dispatch(
+            workspace_dir,
+            pr_creation,
+            &title_file,
+            &body_file,
+            hook_timeout,
+        )
+        .await
+    } else {
+        let script = format!(
+            "git push -u origin HEAD 2>&1 && gh pr create --draft --title \"$(cat {})\" --body-file {} 2>&1",
+            title_file.display(),
+            body_file.display(),
+        );
+        ws_hooks::run_hook(&script, workspace_dir, hook_timeout)
+            .await
+            .map_err(|e| e.to_string())
+    };
+
+    let _ = tokio::fs::remove_file(&title_file).await;
+    let _ = tokio::fs::remove_file(&body_file).await;
+    result
+}
+
+/// Push the branch, kick off a `workflow_dispatch` GitHub Action that opens the PR,
+/// then poll until the PR is observable on the branch.
+async fn open_pr_via_workflow_dispatch(
+    workspace_dir: &std::path::Path,
+    pr_creation: &crate::config::schema::PrCreationConfig,
+    title_file: &std::path::Path,
+    body_file: &std::path::Path,
+    hook_timeout: Duration,
+) -> std::result::Result<(), String> {
+    use crate::workspace::hooks as ws_hooks;
+
+    // 1. Push the branch upstream so the workflow can resolve it.
+    ws_hooks::run_hook(
+        "git push -u origin HEAD 2>&1",
+        workspace_dir,
+        hook_timeout,
+    )
+    .await
+    .map_err(|e| format!("git push failed: {e}"))?;
+
+    // 2. Resolve the branch name for the workflow input.
+    let branch = ws_hooks::run_hook_with_output(
+        "git rev-parse --abbrev-ref HEAD",
+        workspace_dir,
+        hook_timeout,
+    )
+    .await
+    .map_err(|e| format!("failed to resolve branch name: {e}"))?
+    .trim()
+    .to_string();
+
+    if branch.is_empty() {
+        return Err("git rev-parse returned an empty branch name".into());
+    }
+
+    // 3. Dispatch the workflow. `gh workflow run -F key=@file` reads the value from
+    // the file, which lets us pass multi-line markdown bodies without shell-quoting.
+    let trigger = format!(
+        "gh workflow run \"{workflow}\" -f \"{branch_input}={branch}\" -F \"{title_input}=@{title}\" -F \"{body_input}=@{body}\" 2>&1",
+        workflow = pr_creation.workflow,
+        branch_input = pr_creation.branch_input,
+        branch = branch,
+        title_input = pr_creation.title_input,
+        title = title_file.display(),
+        body_input = pr_creation.body_input,
+        body = body_file.display(),
+    );
+    ws_hooks::run_hook(&trigger, workspace_dir, hook_timeout)
+        .await
+        .map_err(|e| format!("gh workflow run failed: {e}"))?;
+
+    // 4. Poll for the PR. The workflow runs asynchronously on GitHub's side, so the
+    // PR doesn't exist immediately — but we need to know it landed before returning,
+    // so downstream review tracking (`track_created_pr`) can find the PR number.
+    let interval = pr_creation.poll_interval();
+    let timeout = pr_creation.poll_timeout();
+    let probe_timeout = Duration::from_secs(15);
+    let started = std::time::Instant::now();
+    loop {
+        if ws_hooks::run_hook_with_output(
+            "gh pr view --json number 2>/dev/null",
+            workspace_dir,
+            probe_timeout,
+        )
+        .await
+        .is_ok()
+        {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "workflow `{}` was triggered but the PR did not appear within {}s",
+                pr_creation.workflow,
+                timeout.as_secs()
+            ));
+        }
+        tokio::time::sleep(interval).await;
+    }
 }
 
 /// Read agent-generated PR metadata from the workspace, falling back to defaults.
