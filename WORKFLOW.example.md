@@ -75,9 +75,32 @@ workspace:
 
 hooks:
   # Runs once when a new workspace is created for an issue.
-  # Use git worktree for fast, lightweight checkouts from a local repo:
+  # Self-healing: if a prior run left an orphan branch or worktree (e.g. the
+  # before_remove hook didn't run cleanly), evict it before creating the new
+  # one. Without this, `git worktree add -b` will fail when the branch already
+  # exists from a previous attempt.
   after_create: |
-    git -C ~/Developer/my-org/my-repo worktree add {{ workspace }} -b symposium/bug-{{ issue.safe_identifier }}
+    set -e
+    repo="$HOME/Developer/my-org/my-repo"
+    branch="symposium/bug-{{ issue.safe_identifier }}"
+    workdir="{{ workspace }}"
+    [ -d "$repo/.git" ] || { echo "after_create: $repo is not a git repo" >&2; exit 2; }
+    existing=$(git -C "$repo" worktree list --porcelain | awk -v b="refs/heads/$branch" '/^worktree /{w=$2} $1=="branch" && $2==b {print w; exit}')
+    if [ -n "$existing" ]; then
+      git -C "$repo" worktree unlock "$existing" 2>/dev/null || true
+      git -C "$repo" worktree remove -f -f "$existing" 2>/dev/null || true
+    fi
+    git -C "$repo" branch -D "$branch" 2>/dev/null || true
+    rm -rf "$workdir"
+    git -C "$repo" worktree prune
+    git -C "$repo" worktree add "$workdir" -b "$branch"
+  # Runs when a workspace is being removed (terminal issue or age-based reaping).
+  # `worktree remove` does NOT delete the branch — explicitly drop it so the
+  # next attempt at the same issue identifier starts clean.
+  before_remove: |
+    repo="$HOME/Developer/my-org/my-repo"
+    git -C "$repo" worktree remove --force {{ workspace }} 2>/dev/null || true
+    git -C "$repo" branch -D symposium/bug-{{ issue.safe_identifier }} 2>/dev/null || true
   # Optional: runs before each agent attempt (retries included)
   # before_run: |
   #   git fetch origin main && git rebase origin/main

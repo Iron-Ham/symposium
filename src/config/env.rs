@@ -38,18 +38,11 @@ pub fn expand_config(config: &mut ServiceConfig) {
     config.workspace.root = expand_vars(&config.workspace.root);
     config.codex.command = expand_vars(&config.codex.command);
 
-    if let Some(ref s) = config.hooks.after_create {
-        config.hooks.after_create = Some(expand_vars(s));
-    }
-    if let Some(ref s) = config.hooks.before_run {
-        config.hooks.before_run = Some(expand_vars(s));
-    }
-    if let Some(ref s) = config.hooks.after_run {
-        config.hooks.after_run = Some(expand_vars(s));
-    }
-    if let Some(ref s) = config.hooks.before_remove {
-        config.hooks.before_remove = Some(expand_vars(s));
-    }
+    // Hooks are shell scripts — sh handles its own $VAR expansion at runtime.
+    // Pre-expanding here would clobber shell-local variables (e.g. `$repo` set
+    // earlier in the same hook) with empty strings, since they're not in
+    // symposium's env. Tilde expansion in unquoted argument position is also
+    // POSIX-handled by sh. Leave hook strings verbatim.
 
     config.sentry.org = expand_vars(&config.sentry.org);
     config.sentry.project = expand_vars(&config.sentry.project);

@@ -39,7 +39,25 @@ workspace:
 
 hooks:
   after_create: |
-    git -C ~/Developer/my-org/my-repo worktree add {{ workspace }} -b symposium/task-{{ issue.safe_identifier }}
+    set -e
+    repo="$HOME/Developer/my-org/my-repo"
+    branch="symposium/task-{{ issue.safe_identifier }}"
+    workdir="{{ workspace }}"
+    [ -d "$repo/.git" ] || { echo "after_create: $repo is not a git repo" >&2; exit 2; }
+    # Self-healing: evict any worktree/branch left over from a prior run.
+    existing=$(git -C "$repo" worktree list --porcelain | awk -v b="refs/heads/$branch" '/^worktree /{w=$2} $1=="branch" && $2==b {print w; exit}')
+    if [ -n "$existing" ]; then
+      git -C "$repo" worktree unlock "$existing" 2>/dev/null || true
+      git -C "$repo" worktree remove -f -f "$existing" 2>/dev/null || true
+    fi
+    git -C "$repo" branch -D "$branch" 2>/dev/null || true
+    rm -rf "$workdir"
+    git -C "$repo" worktree prune
+    git -C "$repo" worktree add "$workdir" -b "$branch"
+  before_remove: |
+    repo="$HOME/Developer/my-org/my-repo"
+    git -C "$repo" worktree remove --force {{ workspace }} 2>/dev/null || true
+    git -C "$repo" branch -D symposium/task-{{ issue.safe_identifier }} 2>/dev/null || true
 
 agent:
   max_concurrent_agents: 2  # Leave headroom for bug workflows
